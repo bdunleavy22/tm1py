@@ -31,7 +31,7 @@ class Element(TM1Object):
             # default
             raise ValueError(f"Invalid element type: '{value}'")
 
-    def __init__(self, name, element_type: Union[Types, str], attributes: List[str] = None, unique_name: str = None,
+    def __init__(self, name: str, element_type: Union[Types, str], attributes: List[str] = None, unique_name: str = None,
                  index: int = None):
         self._name = name
         self._unique_name = unique_name

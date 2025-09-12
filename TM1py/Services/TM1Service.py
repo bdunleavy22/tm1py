@@ -2,7 +2,7 @@ import pickle
 import warnings
 
 from TM1py.Services import HierarchyService, SecurityService, ApplicationService, SubsetService, \
-     ProcessService, AnnotationService, ViewService, RestService, CellService, \
+     ProcessService, AnnotationService, ViewService, RestService, CellService, CellsetService, \
      ChoreService, DimensionService, CubeService, ElementService, SandboxService, GitService
 from TM1py.Services.FileService import FileService
 from TM1py.Services.JobService import JobService
@@ -69,6 +69,7 @@ class TM1Service:
         self._tm1_rest = RestService(**kwargs)
         self.annotations = AnnotationService(self._tm1_rest)
         self.cells = CellService(self._tm1_rest)
+        self.cellsets = CellsetService(self._tm1_rest)
         self.chores = ChoreService(self._tm1_rest)
         self.cubes = CubeService(self._tm1_rest)
         self.dimensions = DimensionService(self._tm1_rest)

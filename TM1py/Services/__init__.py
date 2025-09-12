@@ -1,6 +1,7 @@
 from TM1py.Services.AnnotationService import AnnotationService
 from TM1py.Services.ApplicationService import ApplicationService
 from TM1py.Services.CellService import CellService
+from TM1py.Services.CellsetService import CellsetService
 from TM1py.Services.ChoreService import ChoreService
 from TM1py.Services.CubeService import CubeService
 from TM1py.Services.DimensionService import DimensionService

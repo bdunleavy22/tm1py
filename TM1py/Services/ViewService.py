@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 
 import collections
-from typing import List, Tuple, Union
+import json
+from typing import List, Tuple, Union, Optional
 
+from mdxpy import MdxBuilder
 from requests import Response
 
-from TM1py.Exceptions.Exceptions import TM1pyRestException
-from TM1py.Objects import View
+from TM1py.Exceptions.Exceptions import TM1pyRestException, TM1pyException
+from TM1py.Objects import View, Cube, Process
 from TM1py.Objects.MDXView import MDXView
 from TM1py.Objects.NativeView import NativeView
 from TM1py.Services.ObjectService import ObjectService
 from TM1py.Services.RestService import RestService
-from TM1py.Utils import format_url
+from TM1py.Services.ProcessService import ProcessService
+from TM1py.Services.SandboxService import SandboxService
+from TM1py.Utils import format_url, get_cube
 
 
 class ViewService(ObjectService):
@@ -43,23 +47,18 @@ class ViewService(ObjectService):
 
         :return boolean tuple
         """
-        url_template = "/Cubes('{}')/{}('{}')"
+        view_name = view_name.replace(' ', '').lower()
+        url_template = "/Cubes('{}')/{}?$select=Name&$filter=tolower(replace(Name,' ','')) eq '{}'"
         if private is not None:
             url = format_url(url_template, cube_name, "PrivateViews" if private else "Views", view_name)
-            return self._exists(url, **kwargs)
+            return bool(self._rest.GET(url, **kwargs).json()['value'])
 
-        view_types = collections.OrderedDict()
-        view_types['PrivateViews'] = False
-        view_types['Views'] = False
-        for view_type in view_types:
-            try:
-                url = format_url(url_template, cube_name, view_type, view_name)
-                self._rest.GET(url, **kwargs)
-                view_types[view_type] = True
-            except TM1pyRestException as e:
-                if e.status_code != 404:
-                    raise e
-        return tuple(view_types.values())
+        return_vals = []
+        for view_type in ['Views', 'PrivateViews']:
+            url = format_url(url_template, cube_name, view_type, view_name)
+            return_vals.append(bool(self._rest.GET(url, **kwargs).json()['value']))
+
+        return tuple(return_vals)
 
     def get(self, cube_name: str, view_name: str, private: bool = False, **kwargs) -> View:
         view_type = "PrivateViews" if private else "Views"
@@ -285,3 +284,66 @@ class ViewService(ObjectService):
 
     def is_native_view(self, cube_name: str, view_name: str, private=False):
         return not self.is_mdx_view(cube_name, view_name, private)
+
+    def clear_view(self, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, sandbox_name: str = None, private: bool = False,
+                   **kwargs) -> None:
+        view_name, cube_name = None, None
+
+        if isinstance(view, View):
+            view_name = view.name
+            if not cube:
+                cube = view.cube
+        elif isinstance(view, str):
+            view_name = view
+
+        if mdx:
+            cube_name = get_cube(mdx)
+        elif isinstance(cube, Cube):
+            cube_name = cube.name
+        elif isinstance(cube, str):
+            cube_name = cube
+        elif cube is not None:
+            raise TypeError(f"cube must of type '{Optional[Cube | str]}', not {type(cube)}")
+
+        if not view_name:
+            view_name = self.suggest_unique_object_name()
+
+        view_exists = self.exists(cube_name=cube_name, view_name=view_name, private=private, **kwargs)
+
+        try:
+            if not view_exists:
+                if mdx:
+                    self.create(MDXView(cube_name=cube_name, view_name=view_name, MDX=mdx), private=private, **kwargs)
+                elif isinstance(view, View):
+                    self.create(view, private=private, **kwargs)
+                else:
+                    raise ValueError('View does not exist.')
+
+            code = f"ViewZeroOut('{cube_name}','{view_name}');"
+            process = Process(name=self.suggest_unique_object_name(), prolog_procedure=self.generate_enable_sandbox_ti(sandbox_name), epilog_procedure=code)
+
+            process_service = ProcessService(self._rest)
+            success, _, _ = process_service.execute_process_with_return(process, **kwargs)
+            if not success:
+                raise TM1pyException(f"Failed to clear cube: '{cube_name}'.")
+        finally:
+            if not view_exists and (mdx or isinstance(view, View)):
+                self.delete(cube_name, view_name, private=False)
+
+    def sandbox_exists(self, sandbox_name) -> bool:
+        sandbox_service = SandboxService(self._rest)
+        return sandbox_service.exists(sandbox_name)
+
+    def generate_enable_sandbox_ti(self, sandbox_name):
+        if self._rest.sandboxing_disabled:
+            enable_sandbox = ""
+
+        elif sandbox_name:
+            if not self.sandbox_exists(sandbox_name):
+                raise ValueError(f"Sandbox '{sandbox_name}' does not exist")
+
+            enable_sandbox = f"ServerActiveSandboxSet('{sandbox_name}');SetUseActiveSandboxProperty(1);"
+
+        else:
+            enable_sandbox = f"ServerActiveSandboxSet('');SetUseActiveSandboxProperty(0);"
+        return enable_sandbox

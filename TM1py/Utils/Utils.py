@@ -262,11 +262,15 @@ def update_server_on_adminhost(adminhost: str = 'localhost', server_as_dict: Dic
 
     return Server(response.json())
 
-
+url_friendly_replacements = (("'", "''"), ('%', '%25'), ('#', '%23'), ('?', '%3F'), ('&', '%26'), (' ', '%20'))
 def build_url_friendly_object_name(object_name: str) -> str:
     return object_name.replace("'", "''").replace('%', '%25').replace('#', '%23').replace('?', '%3F').replace('&',
                                                                                                               '%26')
 
+def build_object_name_from_url_friendly(url_object_name: str) -> str:
+    for replace, result in url_friendly_replacements:
+        url_object_name = url_object_name.replace(result, replace)
+    return url_object_name
 
 def format_url(url, *args: str, **kwargs: str) -> str:
     """ build url and escape single quotes in args and kwargs
