@@ -272,12 +272,14 @@ def build_object_name_from_url_friendly(url_object_name: str) -> str:
         url_object_name = url_object_name.replace(result, replace)
     return url_object_name
 
-def format_url(url, *args: str, **kwargs: str) -> str:
+def format_url(url, *args: str, add_parameters: Optional[dict] = None, **kwargs: str ) -> str:
     """ build url and escape single quotes in args and kwargs
+    :param add_parameters:
     :param url: url with {} placeholders
     :param args: arguments to placeholders
     :return:
     """
+    if add_parameters is None: add_parameters = dict()
     args = [build_url_friendly_object_name(arg) if isinstance(arg, str) else arg
             for arg
             in args]
@@ -285,6 +287,8 @@ def format_url(url, *args: str, **kwargs: str) -> str:
     kwargs = {key: build_url_friendly_object_name(value) if isinstance(value, str) else value
               for key, value
               in kwargs.items()}
+
+    url = add_url_parameters(url=url, **add_parameters)
 
     return url.format(*args, **kwargs)
 

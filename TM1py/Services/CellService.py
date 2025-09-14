@@ -1119,6 +1119,7 @@ class CellService(ObjectService):
 
         if cellset_as_dict:
             mdx, values = build_mdx_and_values_from_cellset(cellset_as_dict, cube_name, dimensions)
+            print(mdx)
             return self.write_values_through_cellset(
                 mdx=mdx,
                 values=values,

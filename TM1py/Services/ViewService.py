@@ -39,7 +39,7 @@ class ViewService(ObjectService):
         return self._rest.POST(url, view.body, **kwargs)
 
     def exists(self, cube_name: str, view_name: str, private: bool = None, **kwargs):
-        """ Checks if view exists as private, public or both
+        """Checks if view exists as private, public or both
 
         :param cube_name:  string, name of the cube
         :param view_name: string, name of the view
@@ -47,18 +47,26 @@ class ViewService(ObjectService):
 
         :return boolean tuple
         """
-        view_name = view_name.replace(' ', '').lower()
-        url_template = "/Cubes('{}')/{}?$select=Name&$filter=tolower(replace(Name,' ','')) eq '{}'"
+        url_template = "/Cubes('{}')/{}('{}')"
         if private is not None:
             url = format_url(url_template, cube_name, "PrivateViews" if private else "Views", view_name)
-            return bool(self._rest.GET(url, **kwargs).json()['value'])
+            response = self._rest.GET(url, verify_response=False, **kwargs)
+            if not response.ok and response.status_code != 404:
+                raise TM1pyRestException(response.text, status_code=response.status_code, reason=response.reason, headers=response.headers)
+            return response.status_code != 404
 
-        return_vals = []
-        for view_type in ['Views', 'PrivateViews']:
-            url = format_url(url_template, cube_name, view_type, view_name)
-            return_vals.append(bool(self._rest.GET(url, **kwargs).json()['value']))
-
-        return tuple(return_vals)
+        view_types = collections.OrderedDict()
+        view_types["PrivateViews"] = False
+        view_types["Views"] = False
+        for view_type in view_types:
+            try:
+                url = format_url(url_template, cube_name, view_type, view_name)
+                self._rest.GET(url, **kwargs)
+                view_types[view_type] = True
+            except TM1pyRestException as e:
+                if e.status_code != 404:
+                    raise e
+        return tuple(view_types.values())
 
     def get(self, cube_name: str, view_name: str, private: bool = False, **kwargs) -> View:
         view_type = "PrivateViews" if private else "Views"

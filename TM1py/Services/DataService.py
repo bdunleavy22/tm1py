@@ -5,18 +5,23 @@ import functools
 import itertools
 import json
 import math
+import re
+import time
 import uuid
 import warnings
 from collections import OrderedDict
 from concurrent.futures.thread import ThreadPoolExecutor
 from contextlib import suppress
 from io import StringIO
-from typing import List, Union, Dict, Iterable, Tuple, Optional, Any
+from typing import List, Union, Dict, Iterable, Tuple, Optional, Any, Sequence, Literal
 
 import ijson
+import mdxpy
 from mdxpy import MdxHierarchySet, MdxBuilder, Member, MdxTuple
 from requests import Response
 
+from TM1py import NativeView, MDXView, View, ElementService
+from TM1py.Services.CubeService import CubeService
 from TM1py.Exceptions.Exceptions import TM1pyException, TM1pyWritePartialFailureException, TM1pyWriteFailureException, \
     TM1pyRestException
 from TM1py.Objects import View, Cube
@@ -173,17 +178,28 @@ def odata_compact_json(return_as_dict: bool):
 
 
 @decohints
-def convert_input_to_cellset(func):
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        cellset_id = kwargs.pop('cellset_id', None)
-        if not cellset_id:
-            cellset_id = self.create_cellset(**kwargs)
-        return func(self, *args, cellset_id=cellset_id, **kwargs)
-    return wrapper
+def convert_input_to_cellset(non_cellset_args: Optional[int] = 0):
+    def convert_to_cellset_decorator(func):
+        @functools.wraps(func)
+        def convert_to_cellset_wrapper(self, *args, **kwargs):
+            cellset_id = self._convert_to_cellset(*args[non_cellset_args:], **kwargs)
+            return func(self, *args, **kwargs, cellset_id=cellset_id)
+        return convert_to_cellset_wrapper
+    return convert_to_cellset_decorator
 
+# @decohints
+# def convert_input_to_view(func):
+#     @functools.wraps(func)
+#     def convert_to_view_wrapper(self, *args, **kwargs):
+#         now = time.time()
+#         view = kwargs.pop('view', None)
+#         if not isinstance(view, View):
+#             view = self._convert_to_view(*args, **kwargs)
+#         print(f'Convert_input_to_view: {time.time()-now}')
+#         return func(self, *args, view=view, **kwargs)
+#     return convert_to_view_wrapper
 
-class CellsetService(ObjectService):
+class DataService(ObjectService):
     """ Service to handle Read and Write operations to TM1 cubes
 
     """
@@ -195,14 +211,200 @@ class CellsetService(ObjectService):
         """
         super().__init__(tm1_rest)
 
-    def create_cellset(self, view: Optional[View | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None,
-                       **kwargs) -> str:
+    def _compact_json_headers(self, kwargs: dict):
+        headers = kwargs.get('headers', self._rest._headers.copy())
+        if not kwargs.get('use_compact_json', None):
+            return headers
+
+        accept_header = headers['Accept']
+        parts = accept_header.split(';')
+        parts.insert(1, 'tm1.compact=v0') # Point of insertion is important. Needs to come after application/json
+        headers['Accept'] = ";".join(parts)
+        kwargs['headers'] = headers
+        return kwargs
+
+    def _convert_elements_to_mdx(self, cube_name: str, elements: Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str], dimensions: Optional[List[str]] = None, **kwargs) -> str:
+        if not dimensions:
+            cube_service = CubeService(self._rest)
+            dimensions = cube_service.get_dimension_names(cube_name=cube_name, **kwargs)
+
+        # Code modified from mdxpy
+        def _convert_to_mdx_member(member_specification: Sequence[str] | str | mdxpy.Member, dimension_name: Optional[str] = None) -> mdxpy.Member:
+            # Trivial Case
+            if isinstance(member_specification, mdxpy.Member):
+                return member_specification
+            # Interpret string into Iterable, then try to _convert_to_member again
+            elif isinstance(member_specification, str):
+                member_specification = re.split(r':|]\.\[', member_specification.strip('{}() ').strip('[] '))
+                if len(member_specification) == 1:
+                    if not dimension_name:
+                        raise ValueError('If only a not UniqueName string is passed for member, dimension_name must be specified')
+                    member_specification = [dimension_name] + member_specification
+                return _convert_to_mdx_member(member_specification)
+
+            elif isinstance(member_specification, Sequence):
+                if len(member_specification) == 1:
+                    return _convert_to_mdx_member(member_specification[0])
+                elif len(member_specification) == 2:
+                    return mdxpy.Member(member_specification[0], member_specification[0], member_specification[1])
+                elif len(member_specification) == 3:
+                    return mdxpy.Member(*member_specification)
+                else:
+                    raise ValueError("member_specification must be Iterable with either one, two or three str arguments")
+
+            else:
+                raise TypeError(f"member_specification must of type '{Sequence[str] | str | mdxpy.Member}', not '{type(member_specification)}'")
+
+        # Code modified from mdxpy
+        def _convert_to_mdx_tuple(tuple_specification: Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str, cube_dimensions: Optional[Sequence[str]] = None):
+            # Trivial Case
+            if isinstance(tuple_specification, mdxpy.MdxTuple):
+                return tuple_specification
+            # Interpret string into Iterable, then try to _convert_to_member again
+            elif isinstance(tuple_specification, str):
+                return _convert_to_mdx_tuple(tuple_specification.strip(' ()').split(','), cube_dimensions)
+
+            elif isinstance(tuple_specification, Iterable):
+                return mdxpy.MdxTuple([_convert_to_mdx_member(member, cube_dimensions[i]) for i, member in enumerate(list(tuple_specification))])
+
+            else:
+                raise TypeError(f"member_specification must of type '{Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str}', not '{type(tuple_specification)}'")
+
+        mdx_tuples_set = mdxpy.MdxSet.tuples([_convert_to_mdx_tuple(mdx_tuple, dimensions) for mdx_tuple in elements])
+        query = mdxpy.MdxBuilder.from_cube(cube_name).add_set_to_axis(0, mdx_tuples_set)
+        return query.to_mdx()
+
+    def _convert_to_elements(self, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]] = None, cellset_id: Optional[str] = None, cellset_as_dict: Optional[dict] = None, df: pd.DataFrame = pd.DataFrame(),
+                            dimensions: Optional[List[str]] = None,
+                            **kwargs) -> Any:
+        # Trivial Case
+        if elements:
+            return elements
+
+        if not dimensions and isinstance(cube, Cube):
+            dimensions = cube.dimensions
+
+        # Input Types that require dimensions
+        if isinstance(view, NativeView) or not df.empty or cellset_as_dict:
+            if not dimensions:
+                cube_service = CubeService(self._rest)
+                dimensions=cube_service.get_dimension_names(cube, **kwargs)
+            if isinstance(view, NativeView):
+                elements_service = ElementService(self._rest)
+                dimension_elements = {axis.dimension_name: [Member.of(axis.dimension_name, axis.hierarchy_name, axis.selected)] for axis in view.titles}
+                for axis in view.rows + view.columns:
+                    axis_elements = axis.subset.elements if axis.subset.is_static else elements_service.execute_set_mdx_element_names(axis.subset.expression)
+                    dimension_elements[axis.dimension_name] = [Member.of(axis.dimension_name, axis.hierarchy_name, element) for element in axis_elements]
+                elements = [dimension_elements[dimension] for dimension in dimensions]
+                return itertools.product(*elements)
+
+            # Convert DF to Cellset_as_dict, Cellset_as_dict to elements
+            if not df.empty:
+                cellset_as_dict = self._convert_df_to_cellset_as_dict(df)
+            if cellset_as_dict:
+                return (Member.of(dimensions[i], element) for elements in cellset_as_dict.keys() for i, element in enumerate(elements))
+
+        # # Create View from MDX
+        # if mdx:
+        #     if not cube_name:
+        #         cube_name = self._get_cube_from_mdx(mdx)
+        #     return MDXView(cube_name=cube_name, view_name=view_name, MDX=mdx)
+        #
+        # # Create View from Elements, DataFrame, or Cellset_as_dict
+        # if cube_name:
+        #     if not df.empty:
+        #         cellset_as_dict = self._convert_df_to_cellset_as_dict(df)
+        #     if cellset_as_dict:
+        #         elements = cellset_as_dict.keys()
+        #     if elements:
+        #         mdx = self._convert_elements_to_mdx(cube_name=cube_name, elements=elements, dimensions=dimensions)
+        #         return self._convert_to_view(view=view_name, cube=cube_name, mdx=mdx, private=private, sandbox_name=sandbox_name)
+        #
+        # # Create View from cellset ID
+        # view_service = ViewService(self._rest)
+        # if cellset_id:
+        #     url = format_url("/Cellsets('{}')/tm1.SaveViewAs?$expand=Cube($select=Name)", cellset_id)
+        #     payload = {'Name': self.suggest_unique_object_name(), 'Overwrite': False, 'MakePrivate': private}
+        #     view_dict = self._rest.POST(url=url, data=json.dumps(payload, ensure_ascii=False), **kwargs).json()
+        #     if 'MDX' in view_dict:
+        #         view = MDXView(cube_name=view_dict['Cube'], view_name=view_dict['Name'], MDX=view_dict["MDX"])
+        #     else:
+        #         view = view_service.get_native_view(cube_name=view_dict['Cube'], view_name=view_dict['Name'], private=private, **kwargs)
+        # elif not cube_name:
+        #     raise TypeError(f"cube could not be inferred from mdx or view. cube must of type '{Optional[Cube | str]}'.")
+        # else:
+        #     view = view_service.get(cube_name=cube_name, view_name=view_name, private=private, **kwargs)
+        # view._exists = True
+        # return view
+
+    # Code modified from TM1py.Utils.Utils.get_cube
+    def _get_cube_from_mdx(self, mdx: str | MdxBuilder, **kwargs):
+        tm1_flags = re.IGNORECASE | re.MULTILINE | re.X
+
+        # happy case: cube name in square brackets
+        search_result = re.search(r"FROM\[(.*?)]", mdx, flags=tm1_flags)
+        if search_result:
+            return search_result.group(1)
+
+        # get in between FROM and WHERE
+        search_result = re.search(r".*SELECT.*ON.*FROM(.*)WHERE\(.*", mdx, flags=tm1_flags)
+        if search_result:
+            return search_result.group(1)
+
+        cellset_id = self._convert_to_cellset(mdx=mdx)
+        url = format_url("/Cellsets('{}')?$expand=Cube($select=Name)", cellset_id)
+        return self._rest.GET(url=url, **kwargs).json()['Cube']['Name']
+
+    def _convert_to_compact_json(self, values: dict):
+        if isinstance(values, dict):
+            values.pop('@odata.context', None)
+            values = values.pop('value', values)
+            if isinstance(values, dict):
+                values = values.values()
+        return [self._convert_to_compact_json(value) for value in values] if isinstance(values, Iterable) and not isinstance(values, str) else values
+
+    @staticmethod
+    def _convert_df_to_cellset_as_dict(df: 'pd.DataFrame') -> Dict[Tuple[str], int | float | str]:
+        if isinstance(df.index, pd.RangeIndex):
+            dimensions = list(df.columns)
+            if 'Value' in dimensions: dimensions.remove('Value')
+            df = df.set_index(dimensions)
+            if 'Value' in df.columns:
+                df = df['Value']
+        else:
+            df = df.stack([i for i in range(df.columns.nlevels)])
+
+        return df.to_dict()
+
+    def _generate_enable_sandbox_ti(self, sandbox_name):
+        if self._rest.sandboxing_disabled:
+            enable_sandbox = ""
+
+        elif sandbox_name:
+            if not self.sandbox_exists(sandbox_name):
+                raise ValueError(f"Sandbox '{sandbox_name}' does not exist")
+
+            enable_sandbox = f"ServerActiveSandboxSet('{sandbox_name}');SetUseActiveSandboxProperty(1);"
+
+        else:
+            enable_sandbox = f"ServerActiveSandboxSet('');SetUseActiveSandboxProperty(0);"
+        return enable_sandbox
+
+    def _convert_to_cellset(self, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]] = None, cellset_id: Optional[str] = None, cellset_as_dict: Optional[dict] = None, df: pd.DataFrame = pd.DataFrame(),
+                            **kwargs) -> str:
         """
         Create a cellset for querying data from a cube using a view or MDX expression.
 
         This method allows creating a cellset either by specifying a cube and view
         (by object or name), or directly via an MDX string or MdxBuilder object.
 
+        :param df:
+        :param cellset_as_dict:
+        :type cellset_as_dict: Optional[dict]
+        :param cellset_id: A cellset ID string. If specified, immediately returned.
+        :type cellset_id: Optional[str]
+        :param elements: An iterable that will be interpreted into an MDX set.
+        :type elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]]
         :param view: A View object or the name of the view to use.
         :type view: Optional[View | str]
         :param cube: A Cube object or the name of the cube to query.
@@ -222,649 +424,330 @@ class CellsetService(ObjectService):
         :raises ValueError: If neither view nor MDX is provided, or if insufficient cube/view information is given.
         :raises TM1pyException: If the cellset creation fails due to a TM1 server error.
         """
-        view_name, cube_name = '', ''
+        if cellset_id:
+            return cellset_id
         if mdx:
-            url = '/ExecuteMDX'
-            data = {'MDX': mdx.to_mdx() if isinstance(mdx, MdxBuilder) else mdx}
-            data = json.dumps(data, ensure_ascii=False)
+            data = json.dumps({'MDX': mdx.to_mdx() if isinstance(mdx, MdxBuilder) else mdx}, ensure_ascii=False)
+            url = format_url('/ExecuteMDX', add_parameters={"!sandbox": sandbox_name})
+            response = self._rest.POST(url=url, data=data, **kwargs).json()
+            return response['ID']
 
+        if cellset_as_dict:
+            return self._convert_to_cellset(view=view, cube=cube, mdx=mdx, private=private, sandbox_name=sandbox_name, elements=cellset_as_dict.keys(), cellset_id=cellset_id, **kwargs)
+
+        # Construct View Name
+        if isinstance(view, View):
+            view_name = view.name
+        elif isinstance(view, str):
+            view_name = view
+        elif view is None:
+            view_name = self.suggest_unique_object_name()
         else:
-            url = "/Cubes('{cube_name}')/{views}('{view_name}')/tm1.Execute"
-            data = ''
+            raise TypeError(f"view must of type '{Optional[View | str]}', not {type(view)}")
 
+        # Construct Cube Name, although not required in some cases
+        if isinstance(cube, Cube):
+            cube_name = cube.name
+        elif isinstance(cube, str):
+            cube_name = cube
+        elif isinstance(view, View):
+            cube_name = view.cube
+        else:
+            raise ValueError(f"cube name could not be determined.")
+
+        # Convert elements into mdx
+        if elements:
             if isinstance(view, View):
-                view_name = view.name
-                if not cube:
-                    cube = view.cube
-            elif isinstance(view, str):
-                view_name = view
-                if not cube:
-                    raise ValueError(f"must provide mdx, view as type {View}, or view as {str} and cube")
+                dimensions = [axis.dimension_name for axis in view.columns+view.rows+view.titles]
+            elif isinstance(cube, Cube):
+                dimensions = cube.dimensions
             else:
-                raise TypeError(f"view must of type '{Optional[View | str]}', not {type(view)}")
+                dimensions = None
+            elements_mdx = self._convert_elements_to_mdx(cube_name=cube_name, elements=elements, dimensions=dimensions, **kwargs)
+            return self._convert_to_cellset(view=view, cube=cube, mdx=elements_mdx, private=private, sandbox_name=sandbox_name, **kwargs)
 
-            if isinstance(cube, Cube):
-                cube_name = cube.name
-            elif isinstance(cube, str):
-                cube_name = cube
-            else:
-                raise TypeError(f"cube must of type '{Optional[Cube | str]}', not {type(cube)}")
+        # Convert Dataframe to elements
+        if not df.empty:
+            # Determine if DataFrame is shaped or not
+            cellset_as_dict = self._convert_df_to_cellset_as_dict(df)
+            return self._convert_to_cellset(view=view, cube=cube, private=private, sandbox_name=sandbox_name, cellset_as_dict=cellset_as_dict, **kwargs)
 
-
-        url = format_url(url, cube_name=cube_name, views='PrivateViews' if private else 'Views', view_name=view_name)
-        url = add_url_parameters(url, **{"!sandbox": sandbox_name})
-        response = self._rest.POST(url=url, data=data, **kwargs).json()
+        # Construct Base URL
+        url = "/Cubes('{cube_name}')/{views}('{view_name}')/tm1.Execute"
+        url = format_url(url, cube_name=cube_name, views='PrivateViews' if private else 'Views', view_name=view_name, add_parameters={"!sandbox": sandbox_name})
+        response = self._rest.POST(url=url, **kwargs).json()
         return response['ID']
 
+    def _convert_to_view(self, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]] = None, cellset_id: Optional[str] = None, cellset_as_dict: Optional[dict] = None, df: pd.DataFrame = pd.DataFrame(),
+                         **kwargs) -> NativeView | MDXView | View:
+        # Get View Name
+        if isinstance(view, View):
+            return view
+        elif isinstance(view, str):
+            view_name = view
+        elif view is None:
+            view_name = self.suggest_unique_object_name()
+        else:
+            raise TypeError(f"view must of type '{Optional[NativeView | MDXView | str]}', not {type(view)}.")
 
-    def clear(self, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, cellset_id: Optional[str] = None,
-              **kwargs) -> None:
+        # Get Cube Name and Dimensions
+        dimensions = None
+        cube_name = None
+        if isinstance(cube, Cube):
+            dimensions = cube.dimensions
+            cube_name = cube.name
+        elif isinstance(cube, str):
+            cube_name = cube
+
+        # Create View from MDX
+        if mdx:
+            if not cube_name:
+                cube_name = self._get_cube_from_mdx(mdx)
+            return MDXView(cube_name=cube_name, view_name=view_name, MDX=mdx)
+
+        # Create View from Elements, DataFrame, or Cellset_as_dict
+        if cube_name:
+            if not df.empty:
+                cellset_as_dict = self._convert_df_to_cellset_as_dict(df)
+            if cellset_as_dict:
+                elements = cellset_as_dict.keys()
+            if elements:
+                mdx = self._convert_elements_to_mdx(cube_name=cube_name, elements=elements, dimensions=dimensions)
+                return self._convert_to_view(view=view_name, cube=cube_name, mdx=mdx, private=private, sandbox_name=sandbox_name)
+
+        # Create View from cellset ID
+        view_service = ViewService(self._rest)
         if cellset_id:
-            url = format_url("/Cellsets('{}')/tm1.SaveViewAs", cellset_id)
-            view = self.suggest_unique_object_name()
-            payload = {'Name': view, 'Overwrite': False, 'MakePrivate': private}
-            view_as_dict = self._rest.POST(url=url, data=json.dumps(payload, ensure_ascii=False), **kwargs).json()
-            cube_name = view_as_dict["@odata.context"][20:view_as_dict["@odata.context"].find("')/")]
-            cube = build_object_name_from_url_friendly(cube_name)
-            mdx = None
+            url = format_url("/Cellsets('{}')/tm1.SaveViewAs?$expand=Cube($select=Name)", cellset_id)
+            payload = {'Name': self.suggest_unique_object_name(), 'Overwrite': False, 'MakePrivate': private}
+            view_dict = self._rest.POST(url=url, data=json.dumps(payload, ensure_ascii=False), **kwargs).json()
+            if 'MDX' in view_dict:
+                view = MDXView(cube_name=view_dict['Cube'], view_name=view_dict['Name'], MDX=view_dict["MDX"])
+            else:
+                view = view_service.get_native_view(cube_name=view_dict['Cube'], view_name=view_dict['Name'], private=private, **kwargs)
+        elif not cube_name:
+            raise TypeError(f"cube could not be inferred from mdx or view. cube must of type '{Optional[Cube | str]}'.")
+        else:
+            view = view_service.get(cube_name=cube_name, view_name=view_name, private=private, **kwargs)
+        view._exists = True
+        return view
+
+    def clear(self, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]] = None, cellset_id: Optional[str] = None, cellset_as_dict: Optional[dict] = None, df: pd.DataFrame = pd.DataFrame(),
+              **kwargs) -> None:
+        view = self._convert_to_view(view=view, cube=cube, mdx=mdx, private=private, sandbox_name=sandbox_name, elements=elements, cellset_id=cellset_id, cellset_as_dict=cellset_as_dict, df=df)
 
         view_service = ViewService(self._rest)
-        view_service.clear_view(view=view, cube=cube, mdx=mdx, sandbox_name=sandbox_name, private=private, **kwargs)
+        process_service = ProcessService(self._rest)
+        epilogue_code = f"ViewZeroOut('{view.cube}','{view.name}');"
 
-    @convert_input_to_cellset
-    def get_value(self, cube_name: str, elements: Union[str, Iterable] = None, dimensions: List[str] = None,
-                  sandbox_name: str = None, element_separator: str = ",", hierarchy_separator: str = "&&",
-                  hierarchy_element_separator: str = "::", **kwargs) -> Union[str, float]:
-        """ Returns cube value from specified coordinates
+        # If the view doesn't exist, create the view and delete after clearing
+        if not getattr(view, '_exists', False):
+            view_service.create(view=view, private=False, **kwargs)
+            epilogue_code += f"ViewDestroy('{view.cube}','{view.name}');"
 
-        :param cube_name: Name of the cube
-        :param elements: Describes the Dimension-Hierarchy-Element arrangement
-            - Example: "Hierarchy1::Element1 && Hierarchy2::Element4, Element9, Element2"
-            - Dimensions are not specified! They are derived from the position.
-            - The , separates the element-selections
-            - If more than one hierarchy is selected per dimension && splits the elementselections
-            - If no Hierarchy is specified. Default Hierarchy will be addressed
-        or
-        Iterable of type mdxpy.Member or similar
-            - Dimension names must be provided in this case! Example: [(Dimension1, Element1), (Dimension2, Element2), (Dimension3, Element3)]
-            - Hierarchys can be included. Example: [(Dimension1, Hierarchy1, Element1), (Dimension1, Hierarchy2, Element2), (Dimension2, Element3)]
-        :param dimensions: List of dimension names in correct order
-        :param sandbox_name: str
-        :param element_separator: Alternative separator for the element selections
-        :param hierarchy_separator: Alternative separator for multiple hierarchies
-        :param hierarchy_element_separator: Alternative separator between hierarchy name and element name
+        # Execute process to clear (and conditionally delete) view
+        process = Process(name=self.suggest_unique_object_name(),
+                          prolog_procedure=self._generate_enable_sandbox_ti(sandbox_name),
+                          epilog_procedure=epilogue_code)
+        success, _, _ = process_service.execute_process_with_return(process, **kwargs)
+        if not success:
+            raise TM1pyException(f"Failed to clear cube: '{view.cube}' with view: '{view.name}'")
+
+    def write(self, values: Optional[Iterable | str | float | int] = None, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]] = None, cellset_id: Optional[str] = None, cellset_as_dict: Optional[dict] = None, df: pd.DataFrame = pd.DataFrame(),
+              method: Literal['cellset'] = 'cellset',
+              **kwargs) -> Response:
+
+        write_function = getattr(self, '_write_through_'+method)
+        return write_function(values=values, view=view, cube=cube, mdx=mdx, private=private, sandbox_name=sandbox_name, elements=elements, cellset_id=cellset_id, cellset_as_dict=cellset_as_dict, df=df, **kwargs)
+
+    def _write_through_cellset(self, values: Optional[Iterable | str | float | int] = None, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]] = None, cellset_id: Optional[str] = None, cellset_as_dict: Optional[dict] = None, df: pd.DataFrame = pd.DataFrame(),
+              **kwargs) -> Response:
+        cellset_id = self._convert_to_cellset(view=view, cube=cube, mdx=mdx, private=private, sandbox_name=sandbox_name, elements=elements, cellset_id=cellset_id, cellset_as_dict=cellset_as_dict, df=df)
+        # Format the URL
+        url = format_url("/Cellsets('{}')/Cells", cellset_id, add_parameters={"!sandbox": sandbox_name})
+
+        # if no values passed, check if values in other argument
+        if not values:
+            if not df.empty:
+                cellset_as_dict = self._convert_df_to_cellset_as_dict(df)
+            if cellset_as_dict:
+                values = cellset_as_dict.values()
+        elif not isinstance(values, Iterable) or isinstance(values, str):
+            values = [values] * self._rest.GET(url=format_url("/Cellsets('{}')/Cells/$count", cellset_id, add_parameters={"!sandbox": sandbox_name})).json()
+
+        data = [{"Ordinal": o, "Value": value} for o, value in enumerate(values)]
+        return self._rest.PATCH(url, json.dumps(data, ensure_ascii=False), **kwargs)
+
+    def _write_through_elements(self, values: Optional[Iterable | str | float | int] = None, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]] = None, cellset_id: Optional[str] = None, cellset_as_dict: Optional[dict] = None, df: pd.DataFrame = pd.DataFrame(),
+              **kwargs) -> Response:
+        elements = self._convert_to_elements(view=view, cube=cube, mdx=mdx, private=private, sandbox_name=sandbox_name, elements=elements, cellset_id=cellset_id, cellset_as_dict=cellset_as_dict, df=df)
+
+    def get_values(self, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]] = None, cellset_id: Optional[str] = None, cellset_as_dict: Optional[dict] = None, df: pd.DataFrame = pd.DataFrame(),
+              compact_json: bool = True,
+              **kwargs) -> List[float | int | str]:
+        """ Returns cube values from specified coordinates
         :return:
+        :rtype: List[float | int | str]
         """
-        mdx_template = "SELECT {} ON ROWS, {} ON COLUMNS FROM [{}]"
-        mdx_strings_list = []
+        cellset_id = self._convert_to_cellset(view=view, cube=cube, mdx=mdx, private=private, sandbox_name=sandbox_name, elements=elements, cellset_id=cellset_id, cellset_as_dict=cellset_as_dict, df=df)
 
-        # Keep backward compatibility with the earlier used "element_string" parameter
-        if elements is None and "element_string" in kwargs:
-            elements = kwargs.pop("element_string")
+        url = format_url("/Cellsets('{}')?$expand=Cells($select=Value)", cellset_id, add_parameters={"!sandbox": sandbox_name})
+        if compact_json: kwargs = self._compact_json_headers(kwargs)
+        values = self._rest.GET(url, **kwargs).json()
+        values = self._convert_to_compact_json(values)
 
-        if not dimensions:
-            dimensions = self.get_dimension_names_for_writing(cube_name=cube_name)
+        return [value[-1] for value in values[1]]
 
-        # Create MDXpy Member from the element string and get the unique name
-        # The unique name can be used to build the MDX query directly
-        if isinstance(elements, str):
-            element_selections = elements.split(element_separator)
-            for dimension_name, element_selection in zip(dimensions, element_selections):
-                if hierarchy_separator not in element_selection:
-                    if hierarchy_element_separator in element_selection:
-                        hierarchy_name, element_name = element_selection.split(hierarchy_element_separator)
-                    else:
-                        hierarchy_name = dimension_name
-                        element_name = element_selection
-
-                    element_definition = Member.of(dimension_name, hierarchy_name, element_name)
-                    mdx_strings_list.append("{" + element_definition.unique_name + "}")
-
-                else:
-                    for element_selection_part in element_selection.split(hierarchy_separator):
-                        hierarchy_name, element_name = element_selection_part.split(hierarchy_element_separator)
-                        element_definition = Member.of(dimension_name, hierarchy_name, element_name)
-                        mdx_strings_list.append("{" + element_definition.unique_name + "}")
-
-        else:
-            # Create MDXpy Member from the Iterator entries
-            for element_definition in elements:
-                if not isinstance(element_definition, Member):
-                    element_definition = Member.of(*element_definition)
-                mdx_strings_list.append("{" + element_definition.unique_name + "}")
-
-        # Build the MDX query
-        # Only the last element is used as the MDX ON COLUMN statement
-        mdx_rows = "*".join(mdx_strings_list[:-1])
-        mdx_columns = mdx_strings_list[-1]
-        mdx = mdx_template.format(mdx_rows, mdx_columns, cube_name)
-
-        # Execute MDX
-        cellset = dict(self.execute_mdx(mdx=mdx, sandbox_name=sandbox_name, **kwargs))
-        return next(iter(cellset.values()))["Value"]
-
-    def get_values(self, cube_name: str, element_sets: Iterable[Iterable[str]] = None, dimensions: List[str] = None,
-                   sandbox_name: str = None, element_separator: str = ",", hierarchy_separator: str = "&&",
-                   hierarchy_element_separator: str = "::", **kwargs) -> List:
-        """ Returns list of cube values from specified coordinates list.  will be in same order as original list
-
-        :param cube_name: Name of the cube
-        :param element_sets: Set of coordinates where each element is provided in the correct dimension order.
-        [('2024', 'Actual', 'London', 'P02), ('2024', 'Forecast', 'Berlin', 'P03)]
-        :param dimensions: Dimension names in correct order
-        :param sandbox_name: str
-        :param element_separator: Alternative separator for the element selections
-        :param hierarchy_separator: Alternative separator for multiple hierarchies
-        :param hierarchy_element_separator: Alternative separator between hierarchy name and element name
-        :return:
+    def get_count(self, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None, elements: Optional[Iterable[Iterable[Sequence[str] | mdxpy.Member | str] | mdxpy.MdxTuple | str]] = None, cellset_id: Optional[str] = None, cellset_as_dict: Optional[dict] = None, df: pd.DataFrame = pd.DataFrame(),
+              **kwargs) -> int:
         """
+        Returns the number of cells in the specified input.
 
-        if not dimensions:
-            dimensions = self.get_dimension_names_for_writing(cube_name=cube_name)
-
-        q = MdxBuilder.from_cube(cube_name)
-
-        for elements in element_sets:
-            members = []
-            element_selections = elements.split(element_separator)
-            for dimension_name, element_selection in zip(dimensions, element_selections):
-                if hierarchy_separator not in element_selection:
-                    if hierarchy_element_separator in element_selection:
-                        hierarchy_name, element_name = element_selection.split(hierarchy_element_separator)
-                    else:
-                        hierarchy_name = dimension_name
-                        element_name = element_selection
-
-                    member = Member.of(dimension_name, hierarchy_name, element_name)
-                    members.append(member)
-                else:
-                    for element_selection_part in element_selection.split(hierarchy_separator):
-                        hierarchy_name, element_name = element_selection_part.split(hierarchy_element_separator)
-                        member = Member.of(dimension_name, hierarchy_name, element_name)
-                        members.append(member)
-
-            q.add_member_tuple_to_columns(MdxTuple(members))
-
-        # Execute MDX
-        return self.execute_mdx_values(mdx=q.to_mdx(), sandbox_name=sandbox_name, **kwargs)
-
-    def _compose_odata_tuple_from_string(self, cube_name: str,
-                                         element_string: str,
-                                         dimensions: Iterable[str] = None,
-                                         element_separator: str = ",",
-                                         hierarchy_separator: str = "&&",
-                                         hierarchy_element_separator: str = "::",
-                                         **kwargs) -> OrderedDict:
-        if not dimensions:
-            dimensions = self.get_dimension_names_for_writing(cube_name=cube_name)
-
-        odata_tuple_as_dict = OrderedDict()
-        element_selections = element_string.split(element_separator)
-        tuple_list = []
-        for dimension_name, element_selection in zip(dimensions, element_selections):
-            if hierarchy_separator not in element_selection:
-                if hierarchy_element_separator in element_selection:
-                    hierarchy_name, element_name = element_selection.split(hierarchy_element_separator)
-                else:
-                    hierarchy_name = dimension_name
-                    element_name = element_selection
-
-                tuple_list.append(format_url("Dimensions('{}')/Hierarchies('{}')/Elements('{}')",
-                                             dimension_name,
-                                             hierarchy_name,
-                                             element_name))
-            else:
-                for element_selection_part in element_selection.split(hierarchy_separator):
-                    hierarchy_name, element_name = element_selection_part.split(hierarchy_element_separator)
-                    tuple_list.append(format_url("Dimensions('{}')/Hierarchies('{}')/Elements('{}')",
-                                                 dimension_name,
-                                                 hierarchy_name,
-                                                 element_name))
-
-        odata_tuple_as_dict["Tuple@odata.bind"] = tuple_list
-
-        return odata_tuple_as_dict
-
-    def _compose_odata_tuple_from_iterable(self, cube_name: str,
-                                           element_tuple: Iterable,
-                                           dimensions: Iterable[str] = None,
-                                           **kwargs) -> OrderedDict:
-        if not dimensions:
-            dimensions = self.get_dimension_names_for_writing(cube_name=cube_name)
-        odata_tuple_as_dict = OrderedDict()
-        odata_tuple_as_dict["Tuple@odata.bind"] = [
-            format_url("Dimensions('{}')/Hierarchies('{}')/Elements('{}')", dim, dim, elem)
-            for dim, elem
-            in zip(dimensions, element_tuple)]
-        return odata_tuple_as_dict
-
-    def trace_cell_calculation(self, cube_name: str,
-                               elements: Union[Iterable, str],
-                               dimensions: Iterable[str] = None,
-                               sandbox_name: str = None,
-                               depth: int = 1,
-                               element_separator: str = ",",
-                               hierarchy_separator: str = "&&",
-                               hierarchy_element_separator: str = "::",
-                               **kwargs) -> Dict:
-
-        """ Trace cell calculation at specified coordinates
-
-        :param cube_name: name of the target cube
-        :param elements:
-        string "Hierarchy1::Element1 && Hierarchy2::Element4, Element9, Element2"
-            - Dimensions are not specified! They are derived from the position.
-            - The , separates the element-selections
-            - If more than one hierarchy is selected per dimension && splits the elementselections
-            - If no Hierarchy is specified. Default Hierarchy will be addressed
-        or
-        Iterable [Element1, Element2, Element3]
-        :param dimensions: optional. Dimension names in their natural order. Will speed up the execution!
-        :param sandbox_name: str
-        :param depth: optional. Depth of the component trace that will be returned. Deeper traces take longer
-        :param element_separator: Alternative separator for the elements, if elements are passed as string
-        :param hierarchy_separator: Alternative separator for multiple hierarchies, if elements are passed as string
-        :param hierarchy_element_separator: Alternative separator between hierarchy name and element name, if elements are passed as string
-        :return: trace json string
+        :return: The number of cells in the specified input.
+        :rtype: int
         """
+        cellset_id = self._convert_to_cellset(view=view, cube=cube, mdx=mdx, private=private, sandbox_name=sandbox_name, elements=elements, cellset_id=cellset_id, cellset_as_dict=cellset_as_dict, df=df)
 
-        expand_query = ''
-        select_query = ''
-        if depth:
-            for x in range(1, depth + 1):
-                component_depth = '/'.join(["Components"] * x)
-                components_tuple_cube = f'{component_depth}/Tuple($select=Name, UniqueName, Type), {component_depth}/Cube($select=Name)'
-                expand_query = ','.join([expand_query, components_tuple_cube])
+        url = format_url("/Cellsets('{}')/Cells/$count", cellset_id, add_parameters={"!sandbox": sandbox_name})
+        return self._rest.GET(url, **kwargs).json()
 
-                component_fields = f'{component_depth}/Type, {component_depth}/Value, {component_depth}/Statements'
-                select_query = ','.join([select_query, component_fields])
+##################################################################
+# - Old CellService Functions, that are waiting to be replaced - #
+##################################################################
 
-        url = format_url("/Cubes('{}')/tm1.TraceCellCalculation?$select=Type,Value,Statements"
-                         "{}&$expand=Tuple($select=Name, UniqueName, Type) {}", cube_name, select_query, expand_query)
-
-        url = add_url_parameters(url, **{"!sandbox": sandbox_name})
-        if isinstance(elements, str):
-            body_as_dict = self._compose_odata_tuple_from_string(cube_name,
-                                                                 elements,
-                                                                 dimensions,
-                                                                 element_separator,
-                                                                 hierarchy_separator,
-                                                                 hierarchy_element_separator)
-        else:
-            body_as_dict = self._compose_odata_tuple_from_iterable(cube_name, elements, dimensions)
-        data = json.dumps(body_as_dict, ensure_ascii=False)
-
-        return json.loads(self._rest.POST(url=url, data=data, **kwargs).content)
-
-    def trace_cell_feeders(self, cube_name: str,
-                           elements: Union[Iterable, str],
-                           dimensions: Iterable[str] = None,
-                           sandbox_name: str = None,
-                           element_separator: str = ",",
-                           hierarchy_separator: str = "&&",
-                           hierarchy_element_separator: str = "::",
-                           **kwargs) -> Dict:
-
-        """ Trace feeders from a cell
-
-        :param cube_name: name of the target cube
-        :param elements:
-        string "Hierarchy1::Element1 && Hierarchy2::Element4, Element9, Element2"
-            - Dimensions are not specified! They are derived from the position.
-            - The , separates the element-selections
-            - If more than one hierarchy is selected per dimension && splits the elementselections
-            - If no Hierarchy is specified. Default Hierarchy will be addressed
-        or
-        Iterable [Element1, Element2, Element3]
-        :param dimensions: optional. Dimension names in their natural order. Will speed up the execution!
-        :param sandbox_name: str
-        :param element_separator: Alternative separator for the elements, if elements are passed as string
-        :param hierarchy_separator: Alternative separator for multiple hierarchies, if elements are passed as string
-        :param hierarchy_element_separator: Alternative separator between hierarchy name and element name, if elements are passed as string
-        :return: feeder trace
-        """
-
-        url = format_url("/Cubes('{}')/tm1.TraceFeeders?$select=Statements,FedCells"
-                         "&$expand=FedCells/Tuple($select=Name,UniqueName,Type), "
-                         "FedCells/Cube($select=Name)", cube_name)
-
-        url = add_url_parameters(url, **{"!sandbox": sandbox_name})
-        if isinstance(elements, str):
-            body_as_dict = self._compose_odata_tuple_from_string(cube_name,
-                                                                 elements,
-                                                                 dimensions,
-                                                                 element_separator,
-                                                                 hierarchy_separator,
-                                                                 hierarchy_element_separator)
-        else:
-            body_as_dict = self._compose_odata_tuple_from_iterable(cube_name, elements, dimensions)
-        data = json.dumps(body_as_dict, ensure_ascii=False)
-
-        return json.loads(self._rest.POST(url=url, data=data, **kwargs).content)
-
-    def check_cell_feeders(self, cube_name: str,
-                           elements: Union[Iterable, str],
-                           dimensions: Iterable[str] = None,
-                           sandbox_name: str = None,
-                           element_separator: str = ",",
-                           hierarchy_separator: str = "&&",
-                           hierarchy_element_separator: str = "::",
-                           **kwargs) -> Dict:
-
-        """ Check feeders
-
-        :param cube_name: name of the target cube
-        :param elements:
-        string "Hierarchy1::Element1 && Hierarchy2::Element4, Element9, Element2"
-            - Dimensions are not specified! They are derived from the position.
-            - The , separates the element-selections
-            - If more than one hierarchy is selected per dimension && splits the elementselections
-            - If no Hierarchy is specified. Default Hierarchy will be addressed
-        or
-        Iterable [Element1, Element2, Element3]
-        :param dimensions: optional. Dimension names in their natural order. Will speed up the execution!
-        :param sandbox_name: str
-        :param element_separator: Alternative separator for the elements, if elements are passed as string
-        :param hierarchy_separator: Alternative separator for multiple hierarchies, if elements are passed as string
-        :param hierarchy_element_separator: Alternative separator between hierarchy name and element name, if elements are passed as string
-        :return: fed cell descriptor
-        """
-
-        url = format_url("/Cubes('{}')/tm1.CheckFeeders"
-                         "?$select=Fed"
-                         "&$expand=Tuple($select=Name,UniqueName,Type),Cube($select=Name)", cube_name)
-
-        url = add_url_parameters(url, **{"!sandbox": sandbox_name})
-        if isinstance(elements, str):
-            body_as_dict = self._compose_odata_tuple_from_string(cube_name,
-                                                                 elements,
-                                                                 dimensions,
-                                                                 element_separator,
-                                                                 hierarchy_separator,
-                                                                 hierarchy_element_separator)
-        else:
-            body_as_dict = self._compose_odata_tuple_from_iterable(cube_name, elements, dimensions)
-        data = json.dumps(body_as_dict, ensure_ascii=False)
-
-        return json.loads(self._rest.POST(url=url, data=data, **kwargs).content)
-
-    def relative_proportional_spread(
-            self,
-            value: float,
-            cube: str,
-            unique_element_names: Iterable[str],
-            reference_unique_element_names: Iterable[str],
-            reference_cube: str = None,
-            sandbox_name: str = None,
-            **kwargs) -> Response:
-        """ Execute relative proportional spread
-
-        :param value: value to be spread
-        :param cube: name of the cube
-        :param unique_element_names: target cell coordinates as unique element names (e.g. ["[d1].[c1]","[d2].[e3]"])
-        :param reference_cube: name of the reference cube. Can be None
-        :param reference_unique_element_names: reference cell coordinates as unique element names
-        :param sandbox_name: str
-        :return:
-        """
-        mdx = """
-        SELECT
-        {{ {rows} }} ON 0
-        FROM [{cube}]
-        """.format(rows="}*{".join(unique_element_names), cube=cube)
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
-
-        payload = {
-            "BeginOrdinal": 0,
-            "Value": "RP" + str(value),
-            "ReferenceCell@odata.bind": list(),
-            "ReferenceCube@odata.bind":
-                format_url("Cubes('{}')", reference_cube if reference_cube else cube)}
-        for unique_element_name in reference_unique_element_names:
-            payload["ReferenceCell@odata.bind"].append(
-                format_url(
-                    "Dimensions('{}')/Hierarchies('{}')/Elements('{}')",
-                    *Utils.dimension_hierarchy_element_tuple_from_unique_name(unique_element_name)))
-
-        return self._post_against_cellset(cellset_id=cellset_id, payload=payload, delete_cellset=True,
-                                          sandbox_name=sandbox_name, **kwargs)
-
-    def clear_spread(
-            self,
-            cube: str,
-            unique_element_names: Iterable[str],
-            sandbox_name: str = None,
-            **kwargs) -> Response:
-        """ Execute clear spread
-        :param cube: name of the cube
-        :param unique_element_names: target cell coordinates as unique element names (e.g. ["[d1].[c1]","[d2].[e3]"])
-        :param sandbox_name: str
-        :return:
-        """
-        mdx = """
-        SELECT
-        {{ {rows} }} ON 0
-        FROM [{cube}]
-        """.format(rows="}*{".join(unique_element_names), cube=cube)
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
-
-        payload = {
-            "BeginOrdinal": 0,
-            "Value": "C",
-            "ReferenceCell@odata.bind": list()}
-        for unique_element_name in unique_element_names:
-            payload["ReferenceCell@odata.bind"].append(
-                format_url(
-                    "Dimensions('{}')/Hierarchies('{}')/Elements('{}')",
-                    *Utils.dimension_hierarchy_element_tuple_from_unique_name(unique_element_name)))
-
-        return self._post_against_cellset(cellset_id=cellset_id, payload=payload, delete_cellset=True,
-                                          sandbox_name=sandbox_name, **kwargs)
-
+    # Notes:
+    #   - clear_with_dataframe: original accepts a "dimension_mapping" argument
+    #   - write_dataframe: significant number of parameters not incorporated into new function
+    a = 1
     # @require_data_admin
     # @require_ops_admin
     # @require_version(version="11.7")
-    # def clear(self, cube: str, **kwargs):
+    # def clear_with_dataframe(self, cube: str, df: 'pd.DataFrame', dimension_mapping: Dict = None, **kwargs):
+    #     """Clears data from a TM1 cube based on the distinct values in a DataFrame over cube dimensions.
+    #         Note:
+    #             This function is similar to `tm1.cells.clear`, but it is designed specifically for clearing data
+    #              based on distinct values in a DataFrame over cube dimensions. The key difference is that this
+    #              function interprets the DataFrame columns as dimensions and supports a mapping (`dimension_mapping`)
+    #              for specifying hierarchies within those dimensions.
+    #
+    #       :param cube: str
+    #           The name of the TM1 cube.
+    #       :param df: pd.DataFrame
+    #           The DataFrame containing distinct values over cube dimensions.
+    #           Columns in the DataFrame should correspond to cube dimensions.
+    #       :param dimension_mapping: Dict, optional
+    #           A dictionary mapping the DataFrame columns to one or many hierarchies within the given dimension.
+    #           If not provided, assumes that the dimensions have just one hierarchy.
+    #
+    #       :return: None
+    #           The function clears data in the specified TM1 cube.
+    #
+    #       :raises ValueError:
+    #           If there are unmatched dimensions in the DataFrame or if specified dimensions
+    #           do not exist in the TM1 cube.
+    #
+    #       :example:
+    #           ```python
+    #
+    #           # Sample DataFrame with distinct values over cube dimensions
+    #           data = {
+    #               "Year": ["2021", "2022"],
+    #               "Organisation": ["some_company", "some_company"],
+    #               "Location": ["Germany", "Albania"]
+    #           }
+    #
+    #           # Sample dimension mapping
+    #           dimensions_mapping = {
+    #               "Organisation": "hierarchy_1",
+    #               "Location": ["hierarchy_2", "hierarchy_3", "hierarchy_4"]
+    #           }
+    #
+    #           dataframe = pd.DataFrame(data)
+    #
+    #           with TM1Service(**kwargs) as tm1:
+    #             tm1.cells.clear_with_dataframe(cube="Sales", df=dataframe)
+    #
+    #           ```
     #     """
-    #     Takes the cube name and keyword argument pairs of dimensions and MDX expressions:
+    #     if not dimension_mapping:
+    #         dimension_mapping = {}
     #
-    #     ```
-    #     tm1.cells.clear(
-    #         cube="Sales",
-    #         salesregion="{[Sales Region].[Australia],[Sales Region].[New Zealand]}",
-    #         product="{[Product].[ABC]}",
-    #         time="{[Time].[2022].Children}")
-    #     ```
+    #     if len(CaseAndSpaceInsensitiveSet(df.columns)) != len(df.columns):
+    #         raise ValueError(f"Column names in DataFrame are not unique identifiers for TM1: {list(df.columns)}")
     #
-    #     Make sure that the keyword argument names (e.g. product) map with the dimension names (e.g. Product) in the cube.
-    #     Spaces in the dimension name (e.g., "Sales Region") must be omitted in the keyword (e.g. "salesregion")
-    #
-    #     :param cube: name of the cube
-    #     :param kwargs: keyword argument pairs of dimension names and mdx set expressions
-    #     :return:
-    #     """
     #     cube_service = self.get_cube_service()
     #     dimension_names = CaseAndSpaceInsensitiveSet(*cube_service.get_dimension_names(cube_name=cube))
-    #     dimension_expression_pairs = CaseAndSpaceInsensitiveDict()
     #
-    #     for kwarg in kwargs:
-    #         if kwarg in dimension_names:
-    #             dimension_expression_pairs[kwarg] = wrap_in_curly_braces(kwargs[kwarg])
+    #     df = df.astype(str)
+    #
+    #     elements_by_column = {col_name: df[col_name].unique() for col_name in df.columns}
+    #
+    #     mdx_selections = {}
+    #     unmatched_dimension_names = []
+    #     for column, elements in elements_by_column.items():
+    #         members = []
+    #
+    #         if column not in dimension_names:
+    #             unmatched_dimension_names.append(column)
+    #
+    #         for element in elements:
+    #             if column in dimension_mapping:
+    #                 hierarchy = dimension_mapping.get(column)
+    #                 if not isinstance(hierarchy, str):
+    #                     raise ValueError(f"Value for key '{column}' in dimension_mapping must be of type str")
+    #                 members.append(Member.of(column, hierarchy, element))
+    #
+    #             else:
+    #                 members.append(Member.of(column, column, element))
+    #         mdx_selections[column] = MdxHierarchySet.members(members)
+    #
+    #     if dimension_mapping:
+    #         for dimension, hierarchies in dimension_mapping.items():
+    #             if dimension not in dimension_names:
+    #                 unmatched_dimension_names.append(dimension)
+    #
+    #             elif isinstance(hierarchies, str):
+    #                 hierarchy = hierarchies
+    #                 mdx_selections[dimension] = MdxHierarchySet.tm1_subset_all(
+    #                     dimension=dimension,
+    #                     hierarchy=hierarchy).filter_by_level(0)
+    #
+    #             elif isinstance(hierarchies, Iterable):
+    #                 for hierarchy in hierarchies:
+    #                     mdx_selections[dimension] = MdxHierarchySet.tm1_subset_all(
+    #                         dimension=dimension,
+    #                         hierarchy=hierarchy).filter_by_level(0)
+    #
+    #             else:
+    #                 raise ValueError(f"Unexpected value type for key '{dimension}' in dimension_mapping")
+    #
+    #     if unmatched_dimension_names:
+    #         raise ValueError(f"Dimension(s) {unmatched_dimension_names} does not exist in cube {cube}."
+    #                          f"\nCheck the source of the dataframe to fix the problem")
     #
     #     for dimension_name in dimension_names:
-    #         if dimension_name not in dimension_expression_pairs:
-    #             expression = MdxHierarchySet.tm1_subset_all(dimension_name).filter_by_level(0).to_mdx()
-    #             dimension_expression_pairs[dimension_name] = expression
+    #         if dimension_name not in mdx_selections:
+    #             mdx_selections[dimension_name] = MdxHierarchySet.tm1_subset_all(dimension_name).filter_by_level(0)
     #
     #     mdx_builder = MdxBuilder.from_cube(cube).columns_non_empty()
-    #     for dimension, expression in dimension_expression_pairs.items():
-    #         hierarchy_set = MdxHierarchySet.from_str(dimension=dimension, hierarchy=dimension, mdx=expression)
-    #         mdx_builder.add_hierarchy_set_to_column_axis(hierarchy_set)
+    #     for dimension, expression in mdx_selections.items():
+    #         mdx_builder.add_hierarchy_set_to_column_axis(expression)
     #
     #     return self.clear_with_mdx(cube=cube, mdx=mdx_builder.to_mdx(), **kwargs)
 
-    @require_data_admin
-    @require_ops_admin
-    @require_version(version="11.7")
-    def clear_with_dataframe(self, cube: str, df: 'pd.DataFrame', dimension_mapping: Dict = None, **kwargs):
-        """Clears data from a TM1 cube based on the distinct values in a DataFrame over cube dimensions.
-            Note:
-                This function is similar to `tm1.cells.clear`, but it is designed specifically for clearing data
-                 based on distinct values in a DataFrame over cube dimensions. The key difference is that this
-                 function interprets the DataFrame columns as dimensions and supports a mapping (`dimension_mapping`)
-                 for specifying hierarchies within those dimensions.
-
-          :param cube: str
-              The name of the TM1 cube.
-          :param df: pd.DataFrame
-              The DataFrame containing distinct values over cube dimensions.
-              Columns in the DataFrame should correspond to cube dimensions.
-          :param dimension_mapping: Dict, optional
-              A dictionary mapping the DataFrame columns to one or many hierarchies within the given dimension.
-              If not provided, assumes that the dimensions have just one hierarchy.
-
-          :return: None
-              The function clears data in the specified TM1 cube.
-
-          :raises ValueError:
-              If there are unmatched dimensions in the DataFrame or if specified dimensions
-              do not exist in the TM1 cube.
-
-          :example:
-              ```python
-
-              # Sample DataFrame with distinct values over cube dimensions
-              data = {
-                  "Year": ["2021", "2022"],
-                  "Organisation": ["some_company", "some_company"],
-                  "Location": ["Germany", "Albania"]
-              }
-
-              # Sample dimension mapping
-              dimensions_mapping = {
-                  "Organisation": "hierarchy_1",
-                  "Location": ["hierarchy_2", "hierarchy_3", "hierarchy_4"]
-              }
-
-              dataframe = pd.DataFrame(data)
-
-              with TM1Service(**kwargs) as tm1:
-                tm1.cells.clear_with_dataframe(cube="Sales", df=dataframe)
-
-              ```
-        """
-        if not dimension_mapping:
-            dimension_mapping = {}
-
-        if len(CaseAndSpaceInsensitiveSet(df.columns)) != len(df.columns):
-            raise ValueError(f"Column names in DataFrame are not unique identifiers for TM1: {list(df.columns)}")
-
-        cube_service = self.get_cube_service()
-        dimension_names = CaseAndSpaceInsensitiveSet(*cube_service.get_dimension_names(cube_name=cube))
-
-        df = df.astype(str)
-
-        elements_by_column = {col_name: df[col_name].unique() for col_name in df.columns}
-
-        mdx_selections = {}
-        unmatched_dimension_names = []
-        for column, elements in elements_by_column.items():
-            members = []
-
-            if column not in dimension_names:
-                unmatched_dimension_names.append(column)
-
-            for element in elements:
-                if column in dimension_mapping:
-                    hierarchy = dimension_mapping.get(column)
-                    if not isinstance(hierarchy, str):
-                        raise ValueError(f"Value for key '{column}' in dimension_mapping must be of type str")
-                    members.append(Member.of(column, hierarchy, element))
-
-                else:
-                    members.append(Member.of(column, column, element))
-            mdx_selections[column] = MdxHierarchySet.members(members)
-
-        if dimension_mapping:
-            for dimension, hierarchies in dimension_mapping.items():
-                if dimension not in dimension_names:
-                    unmatched_dimension_names.append(dimension)
-
-                elif isinstance(hierarchies, str):
-                    hierarchy = hierarchies
-                    mdx_selections[dimension] = MdxHierarchySet.tm1_subset_all(
-                        dimension=dimension,
-                        hierarchy=hierarchy).filter_by_level(0)
-
-                elif isinstance(hierarchies, Iterable):
-                    for hierarchy in hierarchies:
-                        mdx_selections[dimension] = MdxHierarchySet.tm1_subset_all(
-                            dimension=dimension,
-                            hierarchy=hierarchy).filter_by_level(0)
-
-                else:
-                    raise ValueError(f"Unexpected value type for key '{dimension}' in dimension_mapping")
-
-        if unmatched_dimension_names:
-            raise ValueError(f"Dimension(s) {unmatched_dimension_names} does not exist in cube {cube}."
-                             f"\nCheck the source of the dataframe to fix the problem")
-
-        for dimension_name in dimension_names:
-            if dimension_name not in mdx_selections:
-                mdx_selections[dimension_name] = MdxHierarchySet.tm1_subset_all(dimension_name).filter_by_level(0)
-
-        mdx_builder = MdxBuilder.from_cube(cube).columns_non_empty()
-        for dimension, expression in mdx_selections.items():
-            mdx_builder.add_hierarchy_set_to_column_axis(expression)
-
-        return self.clear_with_mdx(cube=cube, mdx=mdx_builder.to_mdx(), **kwargs)
-
-    @require_data_admin
-    @require_ops_admin
-    @require_version(version="11.7")
-    def clear_with_mdx(self, cube: str, mdx: str, sandbox_name: str = None, **kwargs):
-        """ clear a slice in a cube based on an MDX query.
-        Function requires admin permissions, since TM1py uses an unbound TI with a `ViewZeroOut` statement.
-
-        :param cube: name of the cube
-        :param mdx: a valid MDX query
-        :param sandbox_name: a valid existing sandbox for the current user
-        :param kwargs:
-        :return:
-        """
-        view_service = ViewService(self._rest)
-
-        enable_sandbox = self.generate_enable_sandbox_ti(sandbox_name)
-
-        view_name = "".join(['}TM1py', str(uuid.uuid4())])
-        view_service.create(MDXView(cube_name=cube, view_name=view_name, MDX=mdx))
-
-        try:
-            code = f"ViewZeroOut('{cube}','{view_name}');"
-            process = Process(name="")
-            process.prolog_procedure = enable_sandbox
-            process.epilog_procedure = code
-
-            success, _, _ = self.execute_unbound_process(process, **kwargs)
-            if not success:
-                raise TM1pyException(f"Failed to clear cube: '{cube}' with mdx: '{abbreviate_mdx(mdx, 100)}'")
-        finally:
-            if view_service.exists(cube, view_name, private=False):
-                view_service.delete(cube, view_name, private=False)
-
-    @tidy_cellset
-    def _post_against_cellset(self, cellset_id: str, payload: Dict, sandbox_name: str = None, **kwargs) -> Response:
-        """ Execute a post request against a cellset
-
-        :param cellset_id:
-        :param payload:
-        :param sandbox_name: str
-        :param kwargs:
-        :return:
-        """
-        url = format_url("/Cellsets('{}')/tm1.Update", cellset_id)
-        url = add_url_parameters(url, **{"!sandbox": sandbox_name})
-        return self._rest.POST(url=url, data=json.dumps(payload), **kwargs)
+    # @tidy_cellset
+    # def _post_against_cellset(self, cellset_id: str, payload: Dict, sandbox_name: str = None, **kwargs) -> Response:
+    #     """ Execute a post request against a cellset
+    #
+    #     :param cellset_id:
+    #     :param payload:
+    #     :param sandbox_name: str
+    #     :param kwargs:
+    #     :return:
+    #     """
+    #     url = format_url("/Cellsets('{}')/tm1.Update", cellset_id)
+    #     url = add_url_parameters(url, **{"!sandbox": sandbox_name})
+    #     return self._rest.POST(url=url, data=json.dumps(payload), **kwargs)
 
     def get_dimension_names_for_writing(self, cube_name: str, **kwargs) -> List[str]:
         """ Get dimensions of a cube. Skip sandbox dimension
@@ -878,98 +761,98 @@ class CellsetService(ObjectService):
         dimensions = cube_service.get_dimension_names(cube_name, True, **kwargs)
         return dimensions
 
-    @require_pandas
-    def write_dataframe(self, cube_name: str, data: 'pd.DataFrame', dimensions: Iterable[str] = None,
-                        increment: bool = False, deactivate_transaction_log: bool = False,
-                        reactivate_transaction_log: bool = False, sandbox_name: str = None,
-                        use_ti: bool = False, use_blob: bool = False, use_changeset: bool = False,
-                        precision: int = None,
-                        skip_non_updateable: bool = False, measure_dimension_elements: Dict = None,
-                        sum_numeric_duplicates: bool = True, remove_blob: bool = True, allow_spread: bool = False,
-                        clear_view: str = None, static_dimension_elements: Dict = None,
-                        infer_column_order: bool = False,
-                        **kwargs) -> str:
-        """
-        Function expects same shape as `execute_mdx_dataframe` returns.
-        Column order must match dimensions in the target cube with an additional column for the values.
-        Column names are not relevant.
-        :param cube_name:
-        :param data: Pandas Data Frame
-        :param dimensions:
-        :param increment:
-        :param deactivate_transaction_log:
-        :param reactivate_transaction_log:
-        :param sandbox_name:
-        :param use_ti:
-        :param use_blob: Uses blob to write. Requires admin permissions. 10x faster compared to use_ti
-        :param use_changeset: Enable ChangesetID: True or False
-        :param precision: max precision when writhing through unbound process.
-        Necessary when dealing with large numbers to avoid "number too long" TI syntax error
-        :param skip_non_updateable skip cells that are not updateable (e.g. rule derived or consolidated)
-        :param measure_dimension_elements: dictionary of measure elements and their types to improve
-        performance when `use_ti` is `True`.
-        When all written values are numeric you can pass a default dict with default key 'Numeric'
-        :param sum_numeric_duplicates: Aggregate numerical values for duplicated intersections
-        :param remove_blob: remove blob file after writing with use_blob=True
-        :param allow_spread: allow TI process in use_blob or use_ti to use CellPutProportionalSpread on C elements
-        :param clear_view: name of cube view to clear before writing
-        :param static_dimension_elements: Dict of fixed dimension element pairs. Column is created for you.
-        :param infer_column_order: bool indicating whether the column order of the dataframe should automatically be
-         inferred and mapped to the dimension order in the cube.
-        :return: changeset or None
-        """
-        if not isinstance(data, pd.DataFrame):
-            raise ValueError("argument 'data' must of type DataFrame")
-
-        # don't mutate passed data frame. Work on a copy instead
-        data = data.copy()
-
-        if not dimensions:
-            dimensions = self.get_dimension_names_for_writing(cube_name=cube_name)
-
-        infer_column_order = True if static_dimension_elements else infer_column_order
-
-        # reorder columns in df to align with dimensions; CaseAndSpaceInsensitiveDict is a OrderedDict
-        if static_dimension_elements:
-            for dimension, element in static_dimension_elements.items():
-                if dimension in CaseAndSpaceInsensitiveSet(data.columns):
-                    raise ValueError("one or more of the fixed_dimension_elements are passed as a dataframe column. "
-                                     f"{dimension}: {element} is passed in fixed_dimension_elements. "
-                                     "Either remove the key value pair from the fixed_dimension_elements dict or "
-                                     f"avoid passing the {dimension} column in the dataframe.")
-                data[dimension] = element
-
-        if infer_column_order:
-            data.columns = data.columns.map(lower_and_drop_spaces)
-
-            ordered_columns = list(map(lower_and_drop_spaces, dimensions))
-
-            columns_not_in_dimensions = data.columns.difference(ordered_columns).tolist()
-
-            data = data[ordered_columns + columns_not_in_dimensions]
-
-        if not len(data.columns) == len(dimensions) + 1:
-            raise ValueError("Number of columns in 'data' DataFrame must be number of dimensions in cube + 1")
-
-        cells = build_cellset_from_pandas_dataframe(data, sum_numeric_duplicates=sum_numeric_duplicates)
-
-        return self.write(cube_name=cube_name,
-                          cellset_as_dict=cells,
-                          dimensions=dimensions,
-                          increment=increment,
-                          deactivate_transaction_log=deactivate_transaction_log,
-                          reactivate_transaction_log=reactivate_transaction_log,
-                          sandbox_name=sandbox_name,
-                          use_ti=use_ti,
-                          use_blob=use_blob,
-                          remove_blob=remove_blob,
-                          use_changeset=use_changeset,
-                          precision=precision,
-                          skip_non_updateable=skip_non_updateable,
-                          measure_dimension_elements=measure_dimension_elements,
-                          allow_spread=allow_spread,
-                          clear_view=clear_view,
-                          **kwargs)
+    # @require_pandas
+    # def write_dataframe(self, cube_name: str, data: 'pd.DataFrame', dimensions: Iterable[str] = None,
+    #                     increment: bool = False, deactivate_transaction_log: bool = False,
+    #                     reactivate_transaction_log: bool = False, sandbox_name: str = None,
+    #                     use_ti: bool = False, use_blob: bool = False, use_changeset: bool = False,
+    #                     precision: int = None,
+    #                     skip_non_updateable: bool = False, measure_dimension_elements: Dict = None,
+    #                     sum_numeric_duplicates: bool = True, remove_blob: bool = True, allow_spread: bool = False,
+    #                     clear_view: str = None, static_dimension_elements: Dict = None,
+    #                     infer_column_order: bool = False,
+    #                     **kwargs) -> str:
+    #     """
+    #     Function expects same shape as `execute_mdx_dataframe` returns.
+    #     Column order must match dimensions in the target cube with an additional column for the values.
+    #     Column names are not relevant.
+    #     :param cube_name:
+    #     :param data: Pandas Data Frame
+    #     :param dimensions:
+    #     :param increment:
+    #     :param deactivate_transaction_log:
+    #     :param reactivate_transaction_log:
+    #     :param sandbox_name:
+    #     :param use_ti:
+    #     :param use_blob: Uses blob to write. Requires admin permissions. 10x faster compared to use_ti
+    #     :param use_changeset: Enable ChangesetID: True or False
+    #     :param precision: max precision when writhing through unbound process.
+    #     Necessary when dealing with large numbers to avoid "number too long" TI syntax error
+    #     :param skip_non_updateable skip cells that are not updateable (e.g. rule derived or consolidated)
+    #     :param measure_dimension_elements: dictionary of measure elements and their types to improve
+    #     performance when `use_ti` is `True`.
+    #     When all written values are numeric you can pass a default dict with default key 'Numeric'
+    #     :param sum_numeric_duplicates: Aggregate numerical values for duplicated intersections
+    #     :param remove_blob: remove blob file after writing with use_blob=True
+    #     :param allow_spread: allow TI process in use_blob or use_ti to use CellPutProportionalSpread on C elements
+    #     :param clear_view: name of cube view to clear before writing
+    #     :param static_dimension_elements: Dict of fixed dimension element pairs. Column is created for you.
+    #     :param infer_column_order: bool indicating whether the column order of the dataframe should automatically be
+    #      inferred and mapped to the dimension order in the cube.
+    #     :return: changeset or None
+    #     """
+    #     if not isinstance(data, pd.DataFrame):
+    #         raise ValueError("argument 'data' must of type DataFrame")
+    #
+    #     # don't mutate passed data frame. Work on a copy instead
+    #     data = data.copy()
+    #
+    #     if not dimensions:
+    #         dimensions = self.get_dimension_names_for_writing(cube_name=cube_name)
+    #
+    #     infer_column_order = True if static_dimension_elements else infer_column_order
+    #
+    #     # reorder columns in df to align with dimensions; CaseAndSpaceInsensitiveDict is a OrderedDict
+    #     if static_dimension_elements:
+    #         for dimension, element in static_dimension_elements.items():
+    #             if dimension in CaseAndSpaceInsensitiveSet(data.columns):
+    #                 raise ValueError("one or more of the fixed_dimension_elements are passed as a dataframe column. "
+    #                                  f"{dimension}: {element} is passed in fixed_dimension_elements. "
+    #                                  "Either remove the key value pair from the fixed_dimension_elements dict or "
+    #                                  f"avoid passing the {dimension} column in the dataframe.")
+    #             data[dimension] = element
+    #
+    #     if infer_column_order:
+    #         data.columns = data.columns.map(lower_and_drop_spaces)
+    #
+    #         ordered_columns = list(map(lower_and_drop_spaces, dimensions))
+    #
+    #         columns_not_in_dimensions = data.columns.difference(ordered_columns).tolist()
+    #
+    #         data = data[ordered_columns + columns_not_in_dimensions]
+    #
+    #     if not len(data.columns) == len(dimensions) + 1:
+    #         raise ValueError("Number of columns in 'data' DataFrame must be number of dimensions in cube + 1")
+    #
+    #     cells = build_cellset_from_pandas_dataframe(data, sum_numeric_duplicates=sum_numeric_duplicates)
+    #
+    #     return self.write(cube_name=cube_name,
+    #                       cellset_as_dict=cells,
+    #                       dimensions=dimensions,
+    #                       increment=increment,
+    #                       deactivate_transaction_log=deactivate_transaction_log,
+    #                       reactivate_transaction_log=reactivate_transaction_log,
+    #                       sandbox_name=sandbox_name,
+    #                       use_ti=use_ti,
+    #                       use_blob=use_blob,
+    #                       remove_blob=remove_blob,
+    #                       use_changeset=use_changeset,
+    #                       precision=precision,
+    #                       skip_non_updateable=skip_non_updateable,
+    #                       measure_dimension_elements=measure_dimension_elements,
+    #                       allow_spread=allow_spread,
+    #                       clear_view=clear_view,
+    #                       **kwargs)
 
     @manage_transaction_log
     def write_async(self, cube_name: str, cells: Dict, slice_size: int = 250_000, max_workers: int = 8,
@@ -1124,99 +1007,99 @@ class CellsetService(ObjectService):
         data = json.dumps(body_as_dict, ensure_ascii=False)
         return self._rest.POST(url=url, data=data, **kwargs)
 
-    def write(self, cube_name: str, cellset_as_dict: Dict, dimensions: Iterable[str] = None, increment: bool = False,
-              deactivate_transaction_log: bool = False, reactivate_transaction_log: bool = False,
-              sandbox_name: str = None, use_ti: bool = False, use_blob: bool = False, use_changeset: bool = False,
-              precision: int = None, skip_non_updateable: bool = False, measure_dimension_elements: Dict = None,
-              remove_blob: bool = True, allow_spread: bool = False, clear_view: str = None, **kwargs) -> Optional[str]:
-        """ Write values to a cube
+    # def write(self, cube_name: str, cellset_as_dict: Dict, dimensions: Iterable[str] = None, increment: bool = False,
+    #           deactivate_transaction_log: bool = False, reactivate_transaction_log: bool = False,
+    #           sandbox_name: str = None, use_ti: bool = False, use_blob: bool = False, use_changeset: bool = False,
+    #           precision: int = None, skip_non_updateable: bool = False, measure_dimension_elements: Dict = None,
+    #           remove_blob: bool = True, allow_spread: bool = False, clear_view: str = None, **kwargs) -> Optional[str]:
+    #     """ Write values to a cube
+    #
+    #     Same signature as `write_values` method, but faster since it uses `write_values_through_cellset`
+    #     behind the scenes.
+    #
+    #     Supports incrementing cell values through optional `increment` argument
+    #     Spreading through spreading shortcuts is not supported!
+    #
+    #     :param cube_name: name of the cube
+    #     :param cellset_as_dict: {(elem_a, elem_b, elem_c): 243, (elem_d, elem_e, elem_f) : 109}
+    #     :param dimensions: optional. Dimension names in their natural order. Will speed up the execution!
+    #     :param increment: increment or update cell values
+    #     :param deactivate_transaction_log: deactivate before writing
+    #     :param reactivate_transaction_log: reactivate after writing
+    #     :param sandbox_name: str
+    #     :param use_ti: Use unbound process to write. Requires admin permissions. causes massive performance improvement.
+    #     :param use_blob: Uses blob to write. Requires admin permissions. 10x faster compared to use_ti
+    #     :param use_changeset: Enable ChangesetID: True or False
+    #     :param precision: max precision when writhing through unbound process.
+    #     Necessary when dealing with large numbers to avoid "number too long" TI syntax error.
+    #     :param skip_non_updateable skip cells that are not updateable (e.g. rule derived or consolidated)
+    #     :param measure_dimension_elements: dictionary of measure elements and their types to improve
+    #     performance when `use_ti` is `True`.
+    #     When all written values are numeric you can pass a default dict with default key 'Numeric'
+    #     :param remove_blob: remove blob file after writing with use_blob=True
+    #     :param allow_spread: allow TI process in use_blob or use_ti to use CellPutProportionalSpread on C elements
+    #     :param clear_view: name of cube view to clear before writing
+    #     :return: changeset or None
+    #     """
+    #
+    #     if clear_view and not use_blob:
+    #         raise ValueError("'clear_view' can only be used in conjunction with 'use_blob'")
+    #
+    #     if use_ti:
+    #         return self.write_through_unbound_process(
+    #             cube_name=cube_name,
+    #             cellset_as_dict=cellset_as_dict,
+    #             increment=increment,
+    #             sandbox_name=sandbox_name,
+    #             deactivate_transaction_log=deactivate_transaction_log,
+    #             reactivate_transaction_log=reactivate_transaction_log,
+    #             precision=precision,
+    #             skip_non_updateable=skip_non_updateable,
+    #             measure_dimension_elements=measure_dimension_elements,
+    #             dimensions=dimensions,
+    #             allow_spread=allow_spread,
+    #             **kwargs)
+    #
+    #     if use_blob:
+    #         return self.write_through_blob(
+    #             cube_name=cube_name,
+    #             cellset_as_dict=cellset_as_dict,
+    #             increment=increment,
+    #             sandbox_name=sandbox_name,
+    #             deactivate_transaction_log=deactivate_transaction_log,
+    #             reactivate_transaction_log=reactivate_transaction_log,
+    #             skip_non_updateable=skip_non_updateable,
+    #             dimensions=dimensions,
+    #             remove_blob=remove_blob,
+    #             allow_spread=allow_spread,
+    #             clear_view=clear_view,
+    #             **kwargs)
+    #
+    #     return self.write_through_cellset(cube_name, cellset_as_dict, dimensions, increment, deactivate_transaction_log,
+    #                                       reactivate_transaction_log, sandbox_name, use_changeset, skip_non_updateable,
+    #                                       **kwargs)
 
-        Same signature as `write_values` method, but faster since it uses `write_values_through_cellset`
-        behind the scenes.
-
-        Supports incrementing cell values through optional `increment` argument
-        Spreading through spreading shortcuts is not supported!
-
-        :param cube_name: name of the cube
-        :param cellset_as_dict: {(elem_a, elem_b, elem_c): 243, (elem_d, elem_e, elem_f) : 109}
-        :param dimensions: optional. Dimension names in their natural order. Will speed up the execution!
-        :param increment: increment or update cell values
-        :param deactivate_transaction_log: deactivate before writing
-        :param reactivate_transaction_log: reactivate after writing
-        :param sandbox_name: str
-        :param use_ti: Use unbound process to write. Requires admin permissions. causes massive performance improvement.
-        :param use_blob: Uses blob to write. Requires admin permissions. 10x faster compared to use_ti
-        :param use_changeset: Enable ChangesetID: True or False
-        :param precision: max precision when writhing through unbound process.
-        Necessary when dealing with large numbers to avoid "number too long" TI syntax error.
-        :param skip_non_updateable skip cells that are not updateable (e.g. rule derived or consolidated)
-        :param measure_dimension_elements: dictionary of measure elements and their types to improve
-        performance when `use_ti` is `True`.
-        When all written values are numeric you can pass a default dict with default key 'Numeric'
-        :param remove_blob: remove blob file after writing with use_blob=True
-        :param allow_spread: allow TI process in use_blob or use_ti to use CellPutProportionalSpread on C elements
-        :param clear_view: name of cube view to clear before writing
-        :return: changeset or None
-        """
-
-        if clear_view and not use_blob:
-            raise ValueError("'clear_view' can only be used in conjunction with 'use_blob'")
-
-        if use_ti:
-            return self.write_through_unbound_process(
-                cube_name=cube_name,
-                cellset_as_dict=cellset_as_dict,
-                increment=increment,
-                sandbox_name=sandbox_name,
-                deactivate_transaction_log=deactivate_transaction_log,
-                reactivate_transaction_log=reactivate_transaction_log,
-                precision=precision,
-                skip_non_updateable=skip_non_updateable,
-                measure_dimension_elements=measure_dimension_elements,
-                dimensions=dimensions,
-                allow_spread=allow_spread,
-                **kwargs)
-
-        if use_blob:
-            return self.write_through_blob(
-                cube_name=cube_name,
-                cellset_as_dict=cellset_as_dict,
-                increment=increment,
-                sandbox_name=sandbox_name,
-                deactivate_transaction_log=deactivate_transaction_log,
-                reactivate_transaction_log=reactivate_transaction_log,
-                skip_non_updateable=skip_non_updateable,
-                dimensions=dimensions,
-                remove_blob=remove_blob,
-                allow_spread=allow_spread,
-                clear_view=clear_view,
-                **kwargs)
-
-        return self.write_through_cellset(cube_name, cellset_as_dict, dimensions, increment, deactivate_transaction_log,
-                                          reactivate_transaction_log, sandbox_name, use_changeset, skip_non_updateable,
-                                          **kwargs)
-
-    def write_through_cellset(self, cube_name: str, cellset_as_dict: Dict, dimensions: Iterable[str] = None,
-                              increment: bool = False, deactivate_transaction_log: bool = False,
-                              reactivate_transaction_log: bool = False, sandbox_name: str = None,
-                              use_changeset: bool = False, skip_non_updateable: bool = False, **kwargs) -> str:
-        if not dimensions:
-            dimensions = self.get_dimension_names_for_writing(cube_name=cube_name, **kwargs)
-
-        if skip_non_updateable:
-            cellset_as_dict = self.drop_non_updateable_cells(cellset_as_dict, cube_name, dimensions)
-
-        if cellset_as_dict:
-            mdx, values = build_mdx_and_values_from_cellset(cellset_as_dict, cube_name, dimensions)
-            return self.write_values_through_cellset(
-                mdx=mdx,
-                values=values,
-                increment=increment,
-                deactivate_transaction_log=deactivate_transaction_log,
-                reactivate_transaction_log=reactivate_transaction_log,
-                sandbox_name=sandbox_name,
-                use_changeset=use_changeset,
-                **kwargs)
+    # def write_through_cellset(self, cube_name: str, cellset_as_dict: Dict, dimensions: Iterable[str] = None,
+    #                           increment: bool = False, deactivate_transaction_log: bool = False,
+    #                           reactivate_transaction_log: bool = False, sandbox_name: str = None,
+    #                           use_changeset: bool = False, skip_non_updateable: bool = False, **kwargs) -> str:
+    #     if not dimensions:
+    #         dimensions = self.get_dimension_names_for_writing(cube_name=cube_name, **kwargs)
+    #
+    #     if skip_non_updateable:
+    #         cellset_as_dict = self.drop_non_updateable_cells(cellset_as_dict, cube_name, dimensions)
+    #
+    #     if cellset_as_dict:
+    #         mdx, values = build_mdx_and_values_from_cellset(cellset_as_dict, cube_name, dimensions)
+    #         return self.write_values_through_cellset(
+    #             mdx=mdx,
+    #             values=values,
+    #             increment=increment,
+    #             deactivate_transaction_log=deactivate_transaction_log,
+    #             reactivate_transaction_log=reactivate_transaction_log,
+    #             sandbox_name=sandbox_name,
+    #             use_changeset=use_changeset,
+    #             **kwargs)
 
     def drop_non_updateable_cells(self, cells: Dict, cube_name: str, dimensions: List[str]):
         mdx = build_mdx_from_cellset(cells, cube_name, dimensions)
@@ -1602,177 +1485,165 @@ class CellsetService(ObjectService):
 
         return process
 
-    @staticmethod
-    def _build_attribute_update_statements(cube_name, cellset_as_dict, precision: int = None,
-                                           skip_non_updateable: bool = False, measure_dimension_elements: Dict = None):
-        dimension_name = cube_name[19:]
-        statements = list()
+    # @staticmethod
+    # def _build_attribute_update_statements(cube_name, cellset_as_dict, precision: int = None,
+    #                                        skip_non_updateable: bool = False, measure_dimension_elements: Dict = None):
+    #     dimension_name = cube_name[19:]
+    #     statements = list()
+    #
+    #     for coordinates, value in cellset_as_dict.items():
+    #         # default to 'Numeric' so that not existing elements trigger minor error during TI execution
+    #         raw_element_name = coordinates[0]
+    #         if ":" in raw_element_name:
+    #             hierarchy_name, element_name = raw_element_name.split(":", maxsplit=1)
+    #         else:
+    #             element_name = raw_element_name
+    #             hierarchy_name = dimension_name
+    #         attribute_name = coordinates[-1]
+    #
+    #         try:
+    #             attribute_type = measure_dimension_elements[attribute_name]
+    #
+    #         except KeyError:
+    #             if ":" in attribute_name:
+    #                 attribute_name = attribute_name.split(":")[1]
+    #                 attribute_type = measure_dimension_elements.get(attribute_name, 'String')
+    #             else:
+    #                 attribute_type = 'String'
+    #
+    #         if attribute_type == 'Numeric':
+    #             function_str = "ElementAttrPutN("
+    #             # number strings must not exceed float range
+    #             if isinstance(value, str):
+    #                 try:
+    #                     value_str = format(float(value), f'.{precision}f')
+    #                 except ValueError:
+    #                     value_str = f'{value}'
+    #             elif value is None:
+    #                 value_str = '0'
+    #             else:
+    #                 if precision is None:
+    #                     value_str = frame_to_significant_digits(float(value))
+    #                 else:
+    #                     value_str = format(float(value), f'.{precision}f')
+    #
+    #         # by default assume String for attribute values
+    #         else:
+    #             function_str = 'ElementAttrPutS('
+    #             value_str = str(value).replace("'", "''").replace('\r', '').replace('\n', '')
+    #             value_str = f"'{value_str}'"
+    #
+    #         value_str += ","
+    #
+    #         comma_separated_args = ",".join(
+    #             "'" + element.replace("'", "''") + "'"
+    #             for element
+    #             in [dimension_name, hierarchy_name, element_name, attribute_name])
+    #
+    #         cell_is_updateable_pre = ""
+    #         cell_is_updateable_post = ";"
+    #         if skip_non_updateable:
+    #             cell_is_updateable_pre = f"IF(CellIsUpdateable('{cube_name}', '{raw_element_name}', '{attribute_name}')=1,"
+    #             cell_is_updateable_post = ",0);"
+    #
+    #         statement = "".join([
+    #             cell_is_updateable_pre,
+    #             function_str,
+    #             value_str,
+    #             comma_separated_args,
+    #             ")",
+    #             cell_is_updateable_post])
+    #
+    #         statements.append(statement)
+    #
+    #     return statements
 
-        for coordinates, value in cellset_as_dict.items():
-            # default to 'Numeric' so that not existing elements trigger minor error during TI execution
-            raw_element_name = coordinates[0]
-            if ":" in raw_element_name:
-                hierarchy_name, element_name = raw_element_name.split(":", maxsplit=1)
-            else:
-                element_name = raw_element_name
-                hierarchy_name = dimension_name
-            attribute_name = coordinates[-1]
+    # @staticmethod
+    # def _build_cell_update_statements(cube_name: str, cellset_as_dict: Dict, increment: bool,
+    #                                   measure_dimension_elements: Dict, precision: int = None,
+    #                                   skip_non_updateable: bool = False,
+    #                                   dimensions: List = None, allow_spread: bool = False):
+    #     statements = list()
+    #
+    #     for coordinates, value in cellset_as_dict.items():
+    #         # default to 'Numeric' so that not existing elements trigger minor error during TI execution
+    #         measure_element = coordinates[-1]
+    #         try:
+    #             element_type = measure_dimension_elements[measure_element]
+    #
+    #         except KeyError:
+    #             if ":" in measure_element:
+    #                 measure_element = measure_element.split(":")[1]
+    #                 element_type = measure_dimension_elements.get(measure_element, 'Numeric')
+    #             else:
+    #                 element_type = 'Numeric'
+    #
+    #         if element_type == 'String':
+    #             function_str = 'CellPutS('
+    #             value_str = str(value).replace("'", "''").replace('\r', '').replace('\n', '')
+    #             value_str = f"'{value_str}'"
+    #
+    #         # by default assume numeric, to trigger minor errors on write operations to C elements
+    #         else:
+    #             function_str = "CellIncrementN(" if increment else "CellPutN("
+    #
+    #             # number strings must not exceed float range
+    #             if isinstance(value, str):
+    #                 try:
+    #                     if precision is None:
+    #                         value_str = frame_to_significant_digits(float(value))
+    #                     else:
+    #                         value_str = format(float(value), f'.{precision}f')
+    #                 except ValueError:
+    #                     value_str = f'{value}'
+    #             elif value is None:
+    #                 value_str = '0'
+    #             else:
+    #                 if precision is None:
+    #                     value_str = frame_to_significant_digits(float(value))
+    #                 else:
+    #                     value_str = format(float(value), f'.{precision}f')
+    #
+    #         comma_separated_elements = ",".join("'" + element.replace("'", "''") + "'" for element in coordinates)
+    #
+    #         cell_is_updateable_pre = ""
+    #         cell_is_updateable_post = ";"
+    #         if skip_non_updateable:
+    #             cell_is_updateable_pre = f"IF(CellIsUpdateable('{cube_name}', {comma_separated_elements})=1,"
+    #             cell_is_updateable_post = ",0);"
+    #
+    #         if allow_spread:
+    #             any_c_element_in_write = '% \n'.join([f"ElementType('{dim}', '', '{ele}') @= 'C'" for dim, ele in
+    #                                                   zip(dimensions, coordinates)])
+    #
+    #             consolidated_spread_check_start = f"""
+    #                 IF({any_c_element_in_write});
+    #                     CellPutProportionalSpread({value_str},'{cube_name}',{comma_separated_elements});
+    #                 ELSE;
+    #                 """
+    #
+    #             consolidated_spread_check_end = "ENDIF;"
+    #         else:
+    #             consolidated_spread_check_start = ''
+    #             consolidated_spread_check_end = ''
+    #
+    #         statement = "".join([
+    #             cell_is_updateable_pre,
+    #             consolidated_spread_check_start,
+    #             function_str,
+    #             value_str,
+    #             f",'{cube_name}',",
+    #             comma_separated_elements,
+    #             ")",
+    #             cell_is_updateable_post,
+    #             consolidated_spread_check_end
+    #         ])
+    #
+    #         statements.append(statement)
+    #
+    #     return statements
 
-            try:
-                attribute_type = measure_dimension_elements[attribute_name]
 
-            except KeyError:
-                if ":" in attribute_name:
-                    attribute_name = attribute_name.split(":")[1]
-                    attribute_type = measure_dimension_elements.get(attribute_name, 'String')
-                else:
-                    attribute_type = 'String'
-
-            if attribute_type == 'Numeric':
-                function_str = "ElementAttrPutN("
-                # number strings must not exceed float range
-                if isinstance(value, str):
-                    try:
-                        value_str = format(float(value), f'.{precision}f')
-                    except ValueError:
-                        value_str = f'{value}'
-                elif value is None:
-                    value_str = '0'
-                else:
-                    if precision is None:
-                        value_str = frame_to_significant_digits(float(value))
-                    else:
-                        value_str = format(float(value), f'.{precision}f')
-
-            # by default assume String for attribute values
-            else:
-                function_str = 'ElementAttrPutS('
-                value_str = str(value).replace("'", "''").replace('\r', '').replace('\n', '')
-                value_str = f"'{value_str}'"
-
-            value_str += ","
-
-            comma_separated_args = ",".join(
-                "'" + element.replace("'", "''") + "'"
-                for element
-                in [dimension_name, hierarchy_name, element_name, attribute_name])
-
-            cell_is_updateable_pre = ""
-            cell_is_updateable_post = ";"
-            if skip_non_updateable:
-                cell_is_updateable_pre = f"IF(CellIsUpdateable('{cube_name}', '{raw_element_name}', '{attribute_name}')=1,"
-                cell_is_updateable_post = ",0);"
-
-            statement = "".join([
-                cell_is_updateable_pre,
-                function_str,
-                value_str,
-                comma_separated_args,
-                ")",
-                cell_is_updateable_post])
-
-            statements.append(statement)
-
-        return statements
-
-    @staticmethod
-    def _build_cell_update_statements(cube_name: str, cellset_as_dict: Dict, increment: bool,
-                                      measure_dimension_elements: Dict, precision: int = None,
-                                      skip_non_updateable: bool = False,
-                                      dimensions: List = None, allow_spread: bool = False):
-        statements = list()
-
-        for coordinates, value in cellset_as_dict.items():
-            # default to 'Numeric' so that not existing elements trigger minor error during TI execution
-            measure_element = coordinates[-1]
-            try:
-                element_type = measure_dimension_elements[measure_element]
-
-            except KeyError:
-                if ":" in measure_element:
-                    measure_element = measure_element.split(":")[1]
-                    element_type = measure_dimension_elements.get(measure_element, 'Numeric')
-                else:
-                    element_type = 'Numeric'
-
-            if element_type == 'String':
-                function_str = 'CellPutS('
-                value_str = str(value).replace("'", "''").replace('\r', '').replace('\n', '')
-                value_str = f"'{value_str}'"
-
-            # by default assume numeric, to trigger minor errors on write operations to C elements
-            else:
-                function_str = "CellIncrementN(" if increment else "CellPutN("
-
-                # number strings must not exceed float range
-                if isinstance(value, str):
-                    try:
-                        if precision is None:
-                            value_str = frame_to_significant_digits(float(value))
-                        else:
-                            value_str = format(float(value), f'.{precision}f')
-                    except ValueError:
-                        value_str = f'{value}'
-                elif value is None:
-                    value_str = '0'
-                else:
-                    if precision is None:
-                        value_str = frame_to_significant_digits(float(value))
-                    else:
-                        value_str = format(float(value), f'.{precision}f')
-
-            comma_separated_elements = ",".join("'" + element.replace("'", "''") + "'" for element in coordinates)
-
-            cell_is_updateable_pre = ""
-            cell_is_updateable_post = ";"
-            if skip_non_updateable:
-                cell_is_updateable_pre = f"IF(CellIsUpdateable('{cube_name}', {comma_separated_elements})=1,"
-                cell_is_updateable_post = ",0);"
-
-            if allow_spread:
-                any_c_element_in_write = '% \n'.join([f"ElementType('{dim}', '', '{ele}') @= 'C'" for dim, ele in
-                                                      zip(dimensions, coordinates)])
-
-                consolidated_spread_check_start = f"""
-                    IF({any_c_element_in_write});
-                        CellPutProportionalSpread({value_str},'{cube_name}',{comma_separated_elements});
-                    ELSE;
-                    """
-
-                consolidated_spread_check_end = "ENDIF;"
-            else:
-                consolidated_spread_check_start = ''
-                consolidated_spread_check_end = ''
-
-            statement = "".join([
-                cell_is_updateable_pre,
-                consolidated_spread_check_start,
-                function_str,
-                value_str,
-                f",'{cube_name}',",
-                comma_separated_elements,
-                ")",
-                cell_is_updateable_post,
-                consolidated_spread_check_end
-            ])
-
-            statements.append(statement)
-
-        return statements
-
-    def generate_enable_sandbox_ti(self, sandbox_name):
-        if self._rest.sandboxing_disabled:
-            enable_sandbox = ""
-
-        elif sandbox_name:
-            if not self.sandbox_exists(sandbox_name):
-                raise ValueError(f"Sandbox '{sandbox_name}' does not exist")
-
-            enable_sandbox = f"ServerActiveSandboxSet('{sandbox_name}');SetUseActiveSandboxProperty(1);"
-
-        else:
-            enable_sandbox = f"ServerActiveSandboxSet('');SetUseActiveSandboxProperty(0);"
-        return enable_sandbox
 
     def get_elements_from_all_measure_hierarchies(self, cube_name: str) -> Dict[str, str]:
         from TM1py.Services.CubeService import CubeService
@@ -1794,26 +1665,26 @@ class CellsetService(ObjectService):
 
         return self.execute_unbound_process(process, **kwargs)
 
-    def get_element_service(self):
-        from TM1py import ElementService
-        return ElementService(self._rest)
-
-    def get_cube_service(self):
-        from TM1py import CubeService
-        return CubeService(self._rest)
-
-    def execute_unbound_process(self, process: Process, **kwargs) -> Tuple[bool, str, str]:
-        from TM1py import ProcessService
-        process_service = ProcessService(self._rest)
-
-        return process_service.execute_process_with_return(process, **kwargs)
-
-    def get_error_log_file_content(self, file_name: str, **kwargs) -> str:
-        from TM1py import ProcessService
-        process_service = ProcessService(self._rest)
-
-        return process_service.get_error_log_file_content(file_name, **kwargs)
-
+    # def get_element_service(self):
+    #     from TM1py import ElementService
+    #     return ElementService(self._rest)
+    #
+    # def get_cube_service(self):
+    #     from TM1py import CubeService
+    #     return CubeService(self._rest)
+    #
+    # def execute_unbound_process(self, process: Process, **kwargs) -> Tuple[bool, str, str]:
+    #     from TM1py import ProcessService
+    #     process_service = ProcessService(self._rest)
+    #
+    #     return process_service.execute_process_with_return(process, **kwargs)
+    #
+    # def get_error_log_file_content(self, file_name: str, **kwargs) -> str:
+    #     from TM1py import ProcessService
+    #     process_service = ProcessService(self._rest)
+    #
+    #     return process_service.get_error_log_file_content(file_name, **kwargs)
+    #
     @manage_changeset
     @manage_transaction_log
     def write_values(self, cube_name: str, cellset_as_dict: Dict, dimensions: Iterable[str] = None,
@@ -1888,7 +1759,7 @@ class CellsetService(ObjectService):
 
         changeset = kwargs.get("changeset")
 
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
+        cellset_id = self._convert_to_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
         if increment:
             current_values = self.extract_cellset_values(cellset_id, use_compact_json=True, delete_cellset=False,
                                                          **kwargs)
@@ -1896,93 +1767,93 @@ class CellsetService(ObjectService):
 
         self.update_cellset(cellset_id=cellset_id, values=values, sandbox_name=sandbox_name, **kwargs)
         return changeset
-
-    @tidy_cellset
-    def update_cellset(self, cellset_id: str, values: Iterable, sandbox_name: str = None, changeset: str = None,
-                       **kwargs) -> Response:
-        """ Write values into cellset
-
-        Number of values must match the number of cells in the cellset
-
-        :param cellset_id:
-        :param values: iterable with Numeric and String values
-        :param sandbox_name: str
-        :param changeset:
-        :return:
-        """
-
-        url = format_url("/Cellsets('{}')/Cells", cellset_id)
-        url = add_url_parameters(url, **{"!sandbox": sandbox_name})
-        url = add_url_parameters(url, **{"!ChangeSet": changeset})
-        data = []
-        for o, value in enumerate(values):
-            data.append({
-                "Ordinal": o,
-                "Value": value
-            })
-
-        return self._rest.PATCH(url, json.dumps(data, ensure_ascii=False), **kwargs)
-
-    def execute_mdx(self, mdx: str, cell_properties: List[str] = None, top: int = None, skip_contexts: bool = False,
-                    skip: int = None, skip_zeros: bool = False, skip_consolidated_cells: bool = False,
-                    skip_rule_derived_cells: bool = False, sandbox_name: str = None, element_unique_names: bool = True,
-                    skip_cell_properties: bool = False, use_compact_json: bool = False,
-                    skip_sandbox_dimension: bool = False, max_workers: int = 1, async_axis: int = 0,
-                    **kwargs) -> CaseAndSpaceInsensitiveTuplesDict:
-        """ Execute MDX and return the cells with their properties
-
-        :param mdx: MDX Query, as string
-        :param cell_properties: properties to be queried from the cell. E.g. Value, Ordinal, RuleDerived, ...
-        :param top: Int, number of cells to return (counting from top)
-        :param skip: Int, number of cells to skip (counting from top)
-        :param skip_contexts: skip elements from titles / contexts in response
-        :param skip_zeros: skip zeros in cellset (irrespective of zero suppression in MDX / view)
-        :param skip_consolidated_cells: skip consolidated cells in cellset
-        :param skip_rule_derived_cells: skip rule derived cells in cellset
-        :param sandbox_name: str
-        :param element_unique_names: '[d1].[h1].[e1]' or 'e1'
-        :param skip_cell_properties: cell values in result dictionary, instead of cell_properties dictionary
-        :param use_compact_json: bool
-        :skip_sandbox_dimension: bool = False
-        :return: content in sweet concise structure.
-        """
-        if max_workers > 1:
-            return self.execute_mdx_async(
-                mdx=mdx,
-                cell_properties=cell_properties,
-                top=top,
-                skip=skip,
-                skip_contexts=skip_contexts,
-                skip_zeros=skip_zeros,
-                skip_consolidated_cells=skip_consolidated_cells,
-                skip_rule_derived_cells=skip_rule_derived_cells,
-                sandbox_name=sandbox_name,
-                element_unique_names=element_unique_names,
-                skip_cell_properties=skip_cell_properties,
-                use_compact_json=use_compact_json,
-                skip_sandbox_dimension=skip_sandbox_dimension,
-                max_workers=max_workers,
-                async_axis=async_axis,
-                **kwargs)
-
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
-        return self.extract_cellset(
-            cellset_id=cellset_id,
-            cell_properties=cell_properties,
-            top=top,
-            skip=skip,
-            skip_contexts=skip_contexts,
-            skip_zeros=skip_zeros,
-            skip_consolidated_cells=skip_consolidated_cells,
-            skip_rule_derived_cells=skip_rule_derived_cells,
-            delete_cellset=True,
-            sandbox_name=sandbox_name,
-            element_unique_names=element_unique_names,
-            skip_cell_properties=skip_cell_properties,
-            use_compact_json=use_compact_json,
-            skip_sandbox_dimension=skip_sandbox_dimension,
-            **kwargs)
-
+    #
+    # @tidy_cellset
+    # def update_cellset(self, cellset_id: str, values: Iterable, sandbox_name: str = None, changeset: str = None,
+    #                    **kwargs) -> Response:
+    #     """ Write values into cellset
+    #
+    #     Number of values must match the number of cells in the cellset
+    #
+    #     :param cellset_id:
+    #     :param values: iterable with Numeric and String values
+    #     :param sandbox_name: str
+    #     :param changeset:
+    #     :return:
+    #     """
+    #
+    #     url = format_url("/Cellsets('{}')/Cells", cellset_id)
+    #     url = add_url_parameters(url, **{"!sandbox": sandbox_name})
+    #     url = add_url_parameters(url, **{"!ChangeSet": changeset})
+    #     data = []
+    #     for o, value in enumerate(values):
+    #         data.append({
+    #             "Ordinal": o,
+    #             "Value": value
+    #         })
+    #
+    #     return self._rest.PATCH(url, json.dumps(data, ensure_ascii=False), **kwargs)
+    #
+    # def execute_mdx(self, mdx: str, cell_properties: List[str] = None, top: int = None, skip_contexts: bool = False,
+    #                 skip: int = None, skip_zeros: bool = False, skip_consolidated_cells: bool = False,
+    #                 skip_rule_derived_cells: bool = False, sandbox_name: str = None, element_unique_names: bool = True,
+    #                 skip_cell_properties: bool = False, use_compact_json: bool = False,
+    #                 skip_sandbox_dimension: bool = False, max_workers: int = 1, async_axis: int = 0,
+    #                 **kwargs) -> CaseAndSpaceInsensitiveTuplesDict:
+    #     """ Execute MDX and return the cells with their properties
+    #
+    #     :param mdx: MDX Query, as string
+    #     :param cell_properties: properties to be queried from the cell. E.g. Value, Ordinal, RuleDerived, ...
+    #     :param top: Int, number of cells to return (counting from top)
+    #     :param skip: Int, number of cells to skip (counting from top)
+    #     :param skip_contexts: skip elements from titles / contexts in response
+    #     :param skip_zeros: skip zeros in cellset (irrespective of zero suppression in MDX / view)
+    #     :param skip_consolidated_cells: skip consolidated cells in cellset
+    #     :param skip_rule_derived_cells: skip rule derived cells in cellset
+    #     :param sandbox_name: str
+    #     :param element_unique_names: '[d1].[h1].[e1]' or 'e1'
+    #     :param skip_cell_properties: cell values in result dictionary, instead of cell_properties dictionary
+    #     :param use_compact_json: bool
+    #     :skip_sandbox_dimension: bool = False
+    #     :return: content in sweet concise structure.
+    #     """
+    #     if max_workers > 1:
+    #         return self.execute_mdx_async(
+    #             mdx=mdx,
+    #             cell_properties=cell_properties,
+    #             top=top,
+    #             skip=skip,
+    #             skip_contexts=skip_contexts,
+    #             skip_zeros=skip_zeros,
+    #             skip_consolidated_cells=skip_consolidated_cells,
+    #             skip_rule_derived_cells=skip_rule_derived_cells,
+    #             sandbox_name=sandbox_name,
+    #             element_unique_names=element_unique_names,
+    #             skip_cell_properties=skip_cell_properties,
+    #             use_compact_json=use_compact_json,
+    #             skip_sandbox_dimension=skip_sandbox_dimension,
+    #             max_workers=max_workers,
+    #             async_axis=async_axis,
+    #             **kwargs)
+    #
+    #     cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
+    #     return self.extract_cellset(
+    #         cellset_id=cellset_id,
+    #         cell_properties=cell_properties,
+    #         top=top,
+    #         skip=skip,
+    #         skip_contexts=skip_contexts,
+    #         skip_zeros=skip_zeros,
+    #         skip_consolidated_cells=skip_consolidated_cells,
+    #         skip_rule_derived_cells=skip_rule_derived_cells,
+    #         delete_cellset=True,
+    #         sandbox_name=sandbox_name,
+    #         element_unique_names=element_unique_names,
+    #         skip_cell_properties=skip_cell_properties,
+    #         use_compact_json=use_compact_json,
+    #         skip_sandbox_dimension=skip_sandbox_dimension,
+    #         **kwargs)
+    #
     def execute_mdx_async(self, mdx: str, cell_properties: List[str] = None, top: int = None,
                           skip_contexts: bool = False,
                           skip: int = None, skip_zeros: bool = False, skip_consolidated_cells: bool = False,
@@ -2010,7 +1881,7 @@ class CellsetService(ObjectService):
         :param async_axis: 0 (columns) or 1 (rows). On which axis to parallelize retrieval
         :return: content in sweet concise structure.
         """
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
+        cellset_id = self._convert_to_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
 
         return self.extract_cellset_async(
             cellset_id=cellset_id,
@@ -2030,69 +1901,69 @@ class CellsetService(ObjectService):
             max_workers=max_workers,
             async_axis=async_axis,
             **kwargs)
-
-    def execute_view(self, cube_name: str, view_name: str, private: bool = False, cell_properties: Iterable[str] = None,
-                     top: int = None, skip_contexts: bool = False, skip: int = None, skip_zeros: bool = False,
-                     skip_consolidated_cells: bool = False, skip_rule_derived_cells: bool = False,
-                     sandbox_name: str = None, element_unique_names: bool = True, skip_cell_properties: bool = False,
-                     use_compact_json: bool = False, max_workers: int = 1, async_axis: int = 0,
-                     **kwargs) -> CaseAndSpaceInsensitiveTuplesDict:
-        """ get view content as dictionary with sweet and concise structure.
-            Works on NativeView and MDXView !
-
-        :param cube_name: String, name of the cube
-        :param view_name: String, name of the view
-        :param private: True (private) or False (public)
-        :param cell_properties: List, cell properties: [Values, Status, HasPicklist, etc.]
-        :param private: Boolean
-        :param top: Int, number of cells to return (counting from top)
-        :param skip: Int, number of cells to skip (counting from top)
-        :param skip_contexts: skip elements from titles / contexts in response
-        :param skip_zeros: skip zeros in cellset (irrespective of zero suppression in MDX / view)
-        :param skip_consolidated_cells: skip consolidated cells in cellset
-        :param skip_rule_derived_cells: skip rule derived cells in cellset
-        :param element_unique_names: '[d1].[h1].[e1]' or 'e1'
-        :param sandbox_name: str
-        :param skip_cell_properties: cell values in result dictionary, instead of cell_properties dictionary
-        :param max_workers: Int, number of threads to use in parallel
-        :param async_axis: 0 (columns) or 1 (rows). On which axis to parallelize retrieval
-        :param use_compact_json: bool
-        :return: Dictionary : {([dim1].[elem1], [dim2][elem6]): {'Value':3127.312, 'Ordinal':12}   ....  }
-        """
-        if max_workers > 1:
-            return self.execute_view_async(
-                cube_name=cube_name,
-                view_name=view_name,
-                private=private,
-                top=top,
-                skip=skip,
-                skip_contexts=skip_contexts,
-                skip_zeros=skip_zeros,
-                skip_consolidated_cells=skip_consolidated_cells,
-                skip_rule_derived_cells=skip_rule_derived_cells,
-                sandbox_name=sandbox_name,
-                element_unique_names=element_unique_names,
-                skip_cell_properties=skip_cell_properties,
-                max_workers=max_workers,
-                async_axis=async_axis)
-        cellset_id = self.create_cellset_from_view(cube_name=cube_name, view_name=view_name, private=private,
-                                                   sandbox_name=sandbox_name, **kwargs)
-        return self.extract_cellset(
-            cellset_id=cellset_id,
-            cell_properties=cell_properties,
-            top=top,
-            skip=skip,
-            skip_contexts=skip_contexts,
-            skip_zeros=skip_zeros,
-            skip_consolidated_cells=skip_consolidated_cells,
-            skip_rule_derived_cells=skip_rule_derived_cells,
-            delete_cellset=True,
-            sandbox_name=sandbox_name,
-            element_unique_names=element_unique_names,
-            skip_cell_properties=skip_cell_properties,
-            use_compact_json=use_compact_json,
-            **kwargs)
-
+    #
+    # def execute_view(self, cube_name: str, view_name: str, private: bool = False, cell_properties: Iterable[str] = None,
+    #                  top: int = None, skip_contexts: bool = False, skip: int = None, skip_zeros: bool = False,
+    #                  skip_consolidated_cells: bool = False, skip_rule_derived_cells: bool = False,
+    #                  sandbox_name: str = None, element_unique_names: bool = True, skip_cell_properties: bool = False,
+    #                  use_compact_json: bool = False, max_workers: int = 1, async_axis: int = 0,
+    #                  **kwargs) -> CaseAndSpaceInsensitiveTuplesDict:
+    #     """ get view content as dictionary with sweet and concise structure.
+    #         Works on NativeView and MDXView !
+    #
+    #     :param cube_name: String, name of the cube
+    #     :param view_name: String, name of the view
+    #     :param private: True (private) or False (public)
+    #     :param cell_properties: List, cell properties: [Values, Status, HasPicklist, etc.]
+    #     :param private: Boolean
+    #     :param top: Int, number of cells to return (counting from top)
+    #     :param skip: Int, number of cells to skip (counting from top)
+    #     :param skip_contexts: skip elements from titles / contexts in response
+    #     :param skip_zeros: skip zeros in cellset (irrespective of zero suppression in MDX / view)
+    #     :param skip_consolidated_cells: skip consolidated cells in cellset
+    #     :param skip_rule_derived_cells: skip rule derived cells in cellset
+    #     :param element_unique_names: '[d1].[h1].[e1]' or 'e1'
+    #     :param sandbox_name: str
+    #     :param skip_cell_properties: cell values in result dictionary, instead of cell_properties dictionary
+    #     :param max_workers: Int, number of threads to use in parallel
+    #     :param async_axis: 0 (columns) or 1 (rows). On which axis to parallelize retrieval
+    #     :param use_compact_json: bool
+    #     :return: Dictionary : {([dim1].[elem1], [dim2][elem6]): {'Value':3127.312, 'Ordinal':12}   ....  }
+    #     """
+    #     if max_workers > 1:
+    #         return self.execute_view_async(
+    #             cube_name=cube_name,
+    #             view_name=view_name,
+    #             private=private,
+    #             top=top,
+    #             skip=skip,
+    #             skip_contexts=skip_contexts,
+    #             skip_zeros=skip_zeros,
+    #             skip_consolidated_cells=skip_consolidated_cells,
+    #             skip_rule_derived_cells=skip_rule_derived_cells,
+    #             sandbox_name=sandbox_name,
+    #             element_unique_names=element_unique_names,
+    #             skip_cell_properties=skip_cell_properties,
+    #             max_workers=max_workers,
+    #             async_axis=async_axis)
+    #     cellset_id = self.create_cellset_from_view(cube_name=cube_name, view_name=view_name, private=private,
+    #                                                sandbox_name=sandbox_name, **kwargs)
+    #     return self.extract_cellset(
+    #         cellset_id=cellset_id,
+    #         cell_properties=cell_properties,
+    #         top=top,
+    #         skip=skip,
+    #         skip_contexts=skip_contexts,
+    #         skip_zeros=skip_zeros,
+    #         skip_consolidated_cells=skip_consolidated_cells,
+    #         skip_rule_derived_cells=skip_rule_derived_cells,
+    #         delete_cellset=True,
+    #         sandbox_name=sandbox_name,
+    #         element_unique_names=element_unique_names,
+    #         skip_cell_properties=skip_cell_properties,
+    #         use_compact_json=use_compact_json,
+    #         **kwargs)
+    #
     def execute_view_async(self, cube_name: str, view_name: str, private: bool = False,
                            cell_properties: Iterable[str] = None, top: int = None, skip_contexts: bool = False,
                            skip: int = None, skip_zeros: bool = False, skip_consolidated_cells: bool = False,
@@ -2139,155 +2010,155 @@ class CellsetService(ObjectService):
             async_axis=async_axis,
             **kwargs)
 
-    def execute_mdx_raw(
-            self,
-            mdx: str,
-            cell_properties: Iterable[str] = None,
-            elem_properties: Iterable[str] = None,
-            member_properties: Iterable[str] = None,
-            top: int = None,
-            skip_contexts: bool = False,
-            skip: int = None,
-            skip_zeros: bool = False,
-            skip_consolidated_cells: bool = False,
-            skip_rule_derived_cells: bool = False,
-            sandbox_name: str = None,
-            include_hierarchies: bool = False,
-            use_compact_json: bool = False,
-            **kwargs) -> Dict:
-        """ Execute MDX and return the raw data from TM1
-
-        :param mdx: String, a valid MDX Query
-        :param cell_properties: List of properties to be queried from the cell. E.g. ['Value', 'RuleDerived', ...]
-        :param elem_properties: List of properties to be queried from the elements. E.g. ['Name','Attributes', ...]
-        :param member_properties: List of properties to be queried from the members. E.g. ['Name','Attributes', ...]
-        :param top: Integer limiting the number of cells and the number or rows returned
-        :param skip: Integer limiting the number of cells and the number or rows returned
-        :param skip_contexts: skip elements from titles / contexts in response
-        :param skip_zeros: skip zeros in cellset (irrespective of zero suppression in MDX / view)
-        :param skip_consolidated_cells: skip consolidated cells in cellset
-        :param skip_rule_derived_cells: skip rule derived cells in cellset
-        :param sandbox_name: str
-        :param include_hierarchies: retrieve Hierarchies property on Axes
-        :param use_compact_json: bool
-        :return: Raw format from TM1.
-        """
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
-        return self.extract_cellset_raw(
-            cellset_id=cellset_id,
-            cell_properties=cell_properties,
-            elem_properties=elem_properties,
-            member_properties=member_properties,
-            top=top,
-            skip=skip,
-            delete_cellset=True,
-            skip_contexts=skip_contexts,
-            skip_zeros=skip_zeros,
-            skip_consolidated_cells=skip_consolidated_cells,
-            skip_rule_derived_cells=skip_rule_derived_cells,
-            sandbox_name=sandbox_name,
-            include_hierarchies=include_hierarchies,
-            use_compact_json=use_compact_json,
-            **kwargs)
-
-    def execute_view_raw(
-            self,
-            cube_name: str,
-            view_name: str,
-            private: bool = False,
-            cell_properties: Iterable[str] = None,
-            elem_properties: Iterable[str] = None,
-            member_properties: Iterable[str] = None,
-            top: int = None,
-            skip_contexts: bool = False,
-            skip: int = None,
-            skip_zeros: bool = False,
-            skip_consolidated_cells: bool = False,
-            skip_rule_derived_cells: bool = False,
-            sandbox_name: str = None,
-            use_compact_json: bool = False,
-            **kwargs) -> Dict:
-        """ Execute a cube view and return the raw data from TM1
-
-
-        :param cube_name: String, name of the cube
-        :param view_name: String, name of the view
-        :param private: True (private) or False (public)
-        :param cell_properties: List of properties to be queried from the cell. E.g. ['Value', 'RuleDerived', ...]
-        :param elem_properties: List of properties to be queried from the elements. E.g. ['Name','Attributes', ...]
-        :param member_properties: List of properties to be queried from the members. E.g. ['Name','Attributes', ...]
-        :param top: Integer limiting the number of cells and the number or rows returned
-        :param skip_contexts: skip elements from titles / contexts in response
-        :param skip: Integer limiting the number of cells and the number or rows returned
-        :param skip_zeros: skip zeros in cellset (irrespective of zero suppression in MDX / view)
-        :param skip_consolidated_cells: skip consolidated cells in cellset
-        :param skip_rule_derived_cells: skip rule derived cells in cellset
-        :param sandbox_name: str
-        :param use_compact_json: bool
-        :return: Raw format from TM1.
-        """
-        cellset_id = self.create_cellset_from_view(cube_name=cube_name, view_name=view_name, private=private,
-                                                   sandbox_name=sandbox_name, **kwargs)
-        return self.extract_cellset_raw(
-            cellset_id=cellset_id,
-            cell_properties=cell_properties,
-            elem_properties=elem_properties,
-            member_properties=member_properties,
-            top=top,
-            skip=skip,
-            skip_contexts=skip_contexts,
-            skip_zeros=skip_zeros,
-            skip_rule_derived_cells=skip_rule_derived_cells,
-            skip_consolidated_cells=skip_consolidated_cells,
-            delete_cellset=True,
-            sandbox_name=sandbox_name,
-            use_compact_json=use_compact_json,
-            **kwargs)
-
-    def execute_mdx_values(self, mdx: str, sandbox_name: str = None, use_compact_json: bool = False,
-                           skip_zeros: bool = False, skip_consolidated_cells: bool = False,
-                           skip_rule_derived_cells: bool = False, **kwargs) -> List[Union[str, float]]:
-        """ Optimized for performance. Query only raw cell values.
-        Coordinates are omitted !
-
-        :param mdx: a valid MDX Query
-        :param sandbox_name: str
-        :param use_compact_json: bool
-        :param skip_zeros: bool
-        :param skip_consolidated_cells: bool
-        :param skip_rule_derived_cells: bool
-        :return: List of cell values
-        """
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
-        return self.extract_cellset_values(cellset_id, delete_cellset=True, sandbox_name=sandbox_name,
-                                           skip_zeros=skip_zeros, skip_consolidated_cells=skip_consolidated_cells,
-                                           skip_rule_derived_cells=skip_rule_derived_cells,
-                                           use_compact_json=use_compact_json, **kwargs)
-
-    def execute_view_values(self, cube_name: str, view_name: str, private: bool = False, sandbox_name: str = None,
-                            skip_zeros: bool = False, skip_consolidated_cells: bool = False,
-                            skip_rule_derived_cells: bool = False, use_compact_json: bool = False, **kwargs) -> List[
-        Union[str, float]]:
-        """ Execute view and retrieve only the cell values
-
-        :param cube_name: String, name of the cube
-        :param view_name: String, name of the view
-        :param private: True (private) or False (public)
-        :param sandbox_name: str
-        :param use_compact_json: bool
-        :param skip_zeros: bool
-        :param skip_consolidated_cells: bool
-        :param skip_rule_derived_cells: bool
-        :param kwargs:
-        :return:
-        """
-        cellset_id = self.create_cellset_from_view(cube_name=cube_name, view_name=view_name, private=private,
-                                                   sandbox_name=sandbox_name, **kwargs)
-        return self.extract_cellset_values(cellset_id, delete_cellset=True, sandbox_name=sandbox_name,
-                                           use_compact_json=use_compact_json, skip_zeros=skip_zeros,
-                                           skip_rule_derived_cells=skip_rule_derived_cells,
-                                           skip_consolidated_cells=skip_consolidated_cells, **kwargs)
-
+    # def execute_mdx_raw(
+    #         self,
+    #         mdx: str,
+    #         cell_properties: Iterable[str] = None,
+    #         elem_properties: Iterable[str] = None,
+    #         member_properties: Iterable[str] = None,
+    #         top: int = None,
+    #         skip_contexts: bool = False,
+    #         skip: int = None,
+    #         skip_zeros: bool = False,
+    #         skip_consolidated_cells: bool = False,
+    #         skip_rule_derived_cells: bool = False,
+    #         sandbox_name: str = None,
+    #         include_hierarchies: bool = False,
+    #         use_compact_json: bool = False,
+    #         **kwargs) -> Dict:
+    #     """ Execute MDX and return the raw data from TM1
+    #
+    #     :param mdx: String, a valid MDX Query
+    #     :param cell_properties: List of properties to be queried from the cell. E.g. ['Value', 'RuleDerived', ...]
+    #     :param elem_properties: List of properties to be queried from the elements. E.g. ['Name','Attributes', ...]
+    #     :param member_properties: List of properties to be queried from the members. E.g. ['Name','Attributes', ...]
+    #     :param top: Integer limiting the number of cells and the number or rows returned
+    #     :param skip: Integer limiting the number of cells and the number or rows returned
+    #     :param skip_contexts: skip elements from titles / contexts in response
+    #     :param skip_zeros: skip zeros in cellset (irrespective of zero suppression in MDX / view)
+    #     :param skip_consolidated_cells: skip consolidated cells in cellset
+    #     :param skip_rule_derived_cells: skip rule derived cells in cellset
+    #     :param sandbox_name: str
+    #     :param include_hierarchies: retrieve Hierarchies property on Axes
+    #     :param use_compact_json: bool
+    #     :return: Raw format from TM1.
+    #     """
+    #     cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
+    #     return self.extract_cellset_raw(
+    #         cellset_id=cellset_id,
+    #         cell_properties=cell_properties,
+    #         elem_properties=elem_properties,
+    #         member_properties=member_properties,
+    #         top=top,
+    #         skip=skip,
+    #         delete_cellset=True,
+    #         skip_contexts=skip_contexts,
+    #         skip_zeros=skip_zeros,
+    #         skip_consolidated_cells=skip_consolidated_cells,
+    #         skip_rule_derived_cells=skip_rule_derived_cells,
+    #         sandbox_name=sandbox_name,
+    #         include_hierarchies=include_hierarchies,
+    #         use_compact_json=use_compact_json,
+    #         **kwargs)
+    #
+    # def execute_view_raw(
+    #         self,
+    #         cube_name: str,
+    #         view_name: str,
+    #         private: bool = False,
+    #         cell_properties: Iterable[str] = None,
+    #         elem_properties: Iterable[str] = None,
+    #         member_properties: Iterable[str] = None,
+    #         top: int = None,
+    #         skip_contexts: bool = False,
+    #         skip: int = None,
+    #         skip_zeros: bool = False,
+    #         skip_consolidated_cells: bool = False,
+    #         skip_rule_derived_cells: bool = False,
+    #         sandbox_name: str = None,
+    #         use_compact_json: bool = False,
+    #         **kwargs) -> Dict:
+    #     """ Execute a cube view and return the raw data from TM1
+    #
+    #
+    #     :param cube_name: String, name of the cube
+    #     :param view_name: String, name of the view
+    #     :param private: True (private) or False (public)
+    #     :param cell_properties: List of properties to be queried from the cell. E.g. ['Value', 'RuleDerived', ...]
+    #     :param elem_properties: List of properties to be queried from the elements. E.g. ['Name','Attributes', ...]
+    #     :param member_properties: List of properties to be queried from the members. E.g. ['Name','Attributes', ...]
+    #     :param top: Integer limiting the number of cells and the number or rows returned
+    #     :param skip_contexts: skip elements from titles / contexts in response
+    #     :param skip: Integer limiting the number of cells and the number or rows returned
+    #     :param skip_zeros: skip zeros in cellset (irrespective of zero suppression in MDX / view)
+    #     :param skip_consolidated_cells: skip consolidated cells in cellset
+    #     :param skip_rule_derived_cells: skip rule derived cells in cellset
+    #     :param sandbox_name: str
+    #     :param use_compact_json: bool
+    #     :return: Raw format from TM1.
+    #     """
+    #     cellset_id = self.create_cellset_from_view(cube_name=cube_name, view_name=view_name, private=private,
+    #                                                sandbox_name=sandbox_name, **kwargs)
+    #     return self.extract_cellset_raw(
+    #         cellset_id=cellset_id,
+    #         cell_properties=cell_properties,
+    #         elem_properties=elem_properties,
+    #         member_properties=member_properties,
+    #         top=top,
+    #         skip=skip,
+    #         skip_contexts=skip_contexts,
+    #         skip_zeros=skip_zeros,
+    #         skip_rule_derived_cells=skip_rule_derived_cells,
+    #         skip_consolidated_cells=skip_consolidated_cells,
+    #         delete_cellset=True,
+    #         sandbox_name=sandbox_name,
+    #         use_compact_json=use_compact_json,
+    #         **kwargs)
+    #
+    # def execute_mdx_values(self, mdx: str, sandbox_name: str = None, use_compact_json: bool = False,
+    #                        skip_zeros: bool = False, skip_consolidated_cells: bool = False,
+    #                        skip_rule_derived_cells: bool = False, **kwargs) -> List[Union[str, float]]:
+    #     """ Optimized for performance. Query only raw cell values.
+    #     Coordinates are omitted !
+    #
+    #     :param mdx: a valid MDX Query
+    #     :param sandbox_name: str
+    #     :param use_compact_json: bool
+    #     :param skip_zeros: bool
+    #     :param skip_consolidated_cells: bool
+    #     :param skip_rule_derived_cells: bool
+    #     :return: List of cell values
+    #     """
+    #     cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
+    #     return self.extract_cellset_values(cellset_id, delete_cellset=True, sandbox_name=sandbox_name,
+    #                                        skip_zeros=skip_zeros, skip_consolidated_cells=skip_consolidated_cells,
+    #                                        skip_rule_derived_cells=skip_rule_derived_cells,
+    #                                        use_compact_json=use_compact_json, **kwargs)
+    #
+    # def execute_view_values(self, cube_name: str, view_name: str, private: bool = False, sandbox_name: str = None,
+    #                         skip_zeros: bool = False, skip_consolidated_cells: bool = False,
+    #                         skip_rule_derived_cells: bool = False, use_compact_json: bool = False, **kwargs) -> List[
+    #     Union[str, float]]:
+    #     """ Execute view and retrieve only the cell values
+    #
+    #     :param cube_name: String, name of the cube
+    #     :param view_name: String, name of the view
+    #     :param private: True (private) or False (public)
+    #     :param sandbox_name: str
+    #     :param use_compact_json: bool
+    #     :param skip_zeros: bool
+    #     :param skip_consolidated_cells: bool
+    #     :param skip_rule_derived_cells: bool
+    #     :param kwargs:
+    #     :return:
+    #     """
+    #     cellset_id = self.create_cellset_from_view(cube_name=cube_name, view_name=view_name, private=private,
+    #                                                sandbox_name=sandbox_name, **kwargs)
+    #     return self.extract_cellset_values(cellset_id, delete_cellset=True, sandbox_name=sandbox_name,
+    #                                        use_compact_json=use_compact_json, skip_zeros=skip_zeros,
+    #                                        skip_rule_derived_cells=skip_rule_derived_cells,
+    #                                        skip_consolidated_cells=skip_consolidated_cells, **kwargs)
+    #
     def execute_mdx_rows_and_values(self, mdx: str, element_unique_names: bool = True, sandbox_name: str = None,
                                     **kwargs) -> CaseAndSpaceInsensitiveTuplesDict:
         """ Execute MDX and retrieve row element names and values in a case and space insensitive dictionary
@@ -2298,7 +2169,7 @@ class CellsetService(ObjectService):
         :param kwargs:
         :return:
         """
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
+        cellset_id = self._convert_to_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
         return self.extract_cellset_rows_and_values(cellset_id, element_unique_names, delete_cellset=True,
                                                     sandbox_name=sandbox_name, **kwargs)
 
@@ -2371,7 +2242,7 @@ class CellsetService(ObjectService):
                 mdx_headers=mdx_headers,
                 **kwargs)
 
-        cellset_id = self.create_cellset(mdx, sandbox_name=sandbox_name, **kwargs)
+        cellset_id = self._convert_to_cellset(mdx, sandbox_name=sandbox_name, **kwargs)
 
         if use_iterative_json:
             return self.extract_cellset_csv_iter_json(
@@ -2566,7 +2437,7 @@ class CellsetService(ObjectService):
 
             return build_dataframe_from_csv(raw_csv, sep='~', shaped=shaped, **kwargs)
 
-        cellset_id = self.create_cellset(mdx, sandbox_name=sandbox_name, **kwargs)
+        cellset_id = self._convert_to_cellset(mdx, sandbox_name=sandbox_name, **kwargs)
         return self.extract_cellset_dataframe(cellset_id, top=top, skip=skip, skip_zeros=skip_zeros,
                                               skip_consolidated_cells=skip_consolidated_cells,
                                               skip_rule_derived_cells=skip_rule_derived_cells,
@@ -2632,7 +2503,7 @@ class CellsetService(ObjectService):
 
         # default case
         if not any([use_blob, use_iterative_json]):
-            cellset_id = self.create_cellset(
+            cellset_id = self._convert_to_cellset(
                 mdx=mdx,
                 sandbox_name=sandbox_name)
             return self.extract_cellset_dataframe_shaped(
@@ -2760,7 +2631,7 @@ class CellsetService(ObjectService):
         :param sandbox_name: str
         :return:
         """
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name)
+        cellset_id = self._convert_to_cellset(mdx=mdx, sandbox_name=sandbox_name)
         return self.extract_cellset_dataframe_pivot(
             cellset_id=cellset_id,
             dropna=dropna,
@@ -2775,7 +2646,7 @@ class CellsetService(ObjectService):
         :param sandbox_name: str
         :return: Number of Cells in the CellSet
         """
-        cellset_id = self.create_cellset(mdx, sandbox_name=sandbox_name, **kwargs)
+        cellset_id = self._convert_to_cellset(mdx, sandbox_name=sandbox_name, **kwargs)
         return self.extract_cellset_cellcount(cellset_id, delete_cellset=True, sandbox_name=sandbox_name, **kwargs)
 
     def execute_view_elements_value_dict(self, cube_name: str, view_name: str, private: bool = False,
@@ -2961,7 +2832,7 @@ class CellsetService(ObjectService):
         :param use_compact_json: bool
         :return: dict: { titles: [], headers: [axis][], cells: { Page0: [ [column name, column values], [], ... ], ...}}
         """
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name)
+        cellset_id = self._convert_to_cellset(mdx=mdx, sandbox_name=sandbox_name)
         data = self.extract_cellset_raw(cellset_id=cellset_id,
                                         cell_properties=["Value"],
                                         elem_properties=elem_properties,
@@ -3086,7 +2957,7 @@ class CellsetService(ObjectService):
         :param use_compact_json: bool
         :return: dict :{ titles: [], headers: [axis][], cells:{ Page0:{ Row0:{ [row values], Row1: [], ...}, ...}, ...}}
         """
-        cellset_id = self.create_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
+        cellset_id = self._convert_to_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
         data = self.extract_cellset_raw(cellset_id=cellset_id,
                                         cell_properties=["Value"],
                                         elem_properties=elem_properties,
@@ -4754,7 +4625,7 @@ class CellsetService(ObjectService):
 
         except:
             # fallback: execute MDX and extract axes setup (slow)
-            cellset_id = self.create_cellset(mdx)
+            cellset_id = self._convert_to_cellset(mdx)
             cube, _, rows, columns = self.extract_cellset_composition(cellset_id, delete_cellset=True, **kwargs)
 
         if not cube_dimensions:
@@ -4898,3 +4769,276 @@ class CellsetService(ObjectService):
             in view.titles]
 
         return cube_name, titles, rows, columns
+
+    def _compose_odata_tuple_from_string(self, cube_name: str,
+                                         element_string: str,
+                                         dimensions: Iterable[str] = None,
+                                         element_separator: str = ",",
+                                         hierarchy_separator: str = "&&",
+                                         hierarchy_element_separator: str = "::",
+                                         **kwargs) -> OrderedDict:
+        if not dimensions:
+            dimensions = self.get_dimension_names_for_writing(cube_name=cube_name)
+
+        odata_tuple_as_dict = OrderedDict()
+        element_selections = element_string.split(element_separator)
+        tuple_list = []
+        for dimension_name, element_selection in zip(dimensions, element_selections):
+            if hierarchy_separator not in element_selection:
+                if hierarchy_element_separator in element_selection:
+                    hierarchy_name, element_name = element_selection.split(hierarchy_element_separator)
+                else:
+                    hierarchy_name = dimension_name
+                    element_name = element_selection
+
+                tuple_list.append(format_url("Dimensions('{}')/Hierarchies('{}')/Elements('{}')",
+                                             dimension_name,
+                                             hierarchy_name,
+                                             element_name))
+            else:
+                for element_selection_part in element_selection.split(hierarchy_separator):
+                    hierarchy_name, element_name = element_selection_part.split(hierarchy_element_separator)
+                    tuple_list.append(format_url("Dimensions('{}')/Hierarchies('{}')/Elements('{}')",
+                                                 dimension_name,
+                                                 hierarchy_name,
+                                                 element_name))
+
+        odata_tuple_as_dict["Tuple@odata.bind"] = tuple_list
+
+        return odata_tuple_as_dict
+
+    def _compose_odata_tuple_from_iterable(self, cube_name: str,
+                                           element_tuple: Iterable,
+                                           dimensions: Iterable[str] = None,
+                                           **kwargs) -> OrderedDict:
+        if not dimensions:
+            dimensions = self.get_dimension_names_for_writing(cube_name=cube_name)
+        odata_tuple_as_dict = OrderedDict()
+        odata_tuple_as_dict["Tuple@odata.bind"] = [
+            format_url("Dimensions('{}')/Hierarchies('{}')/Elements('{}')", dim, dim, elem)
+            for dim, elem
+            in zip(dimensions, element_tuple)]
+        return odata_tuple_as_dict
+
+    def trace_cell_calculation(self, cube_name: str,
+                               elements: Union[Iterable, str],
+                               dimensions: Iterable[str] = None,
+                               sandbox_name: str = None,
+                               depth: int = 1,
+                               element_separator: str = ",",
+                               hierarchy_separator: str = "&&",
+                               hierarchy_element_separator: str = "::",
+                               **kwargs) -> Dict:
+
+        """ Trace cell calculation at specified coordinates
+
+        :param cube_name: name of the target cube
+        :param elements:
+        string "Hierarchy1::Element1 && Hierarchy2::Element4, Element9, Element2"
+            - Dimensions are not specified! They are derived from the position.
+            - The , separates the element-selections
+            - If more than one hierarchy is selected per dimension && splits the elementselections
+            - If no Hierarchy is specified. Default Hierarchy will be addressed
+        or
+        Iterable [Element1, Element2, Element3]
+        :param dimensions: optional. Dimension names in their natural order. Will speed up the execution!
+        :param sandbox_name: str
+        :param depth: optional. Depth of the component trace that will be returned. Deeper traces take longer
+        :param element_separator: Alternative separator for the elements, if elements are passed as string
+        :param hierarchy_separator: Alternative separator for multiple hierarchies, if elements are passed as string
+        :param hierarchy_element_separator: Alternative separator between hierarchy name and element name, if elements are passed as string
+        :return: trace json string
+        """
+
+        expand_query = ''
+        select_query = ''
+        if depth:
+            for x in range(1, depth + 1):
+                component_depth = '/'.join(["Components"] * x)
+                components_tuple_cube = f'{component_depth}/Tuple($select=Name, UniqueName, Type), {component_depth}/Cube($select=Name)'
+                expand_query = ','.join([expand_query, components_tuple_cube])
+
+                component_fields = f'{component_depth}/Type, {component_depth}/Value, {component_depth}/Statements'
+                select_query = ','.join([select_query, component_fields])
+
+        url = format_url("/Cubes('{}')/tm1.TraceCellCalculation?$select=Type,Value,Statements"
+                         "{}&$expand=Tuple($select=Name, UniqueName, Type) {}", cube_name, select_query, expand_query)
+
+        url = add_url_parameters(url, **{"!sandbox": sandbox_name})
+        if isinstance(elements, str):
+            body_as_dict = self._compose_odata_tuple_from_string(cube_name,
+                                                                 elements,
+                                                                 dimensions,
+                                                                 element_separator,
+                                                                 hierarchy_separator,
+                                                                 hierarchy_element_separator)
+        else:
+            body_as_dict = self._compose_odata_tuple_from_iterable(cube_name, elements, dimensions)
+        data = json.dumps(body_as_dict, ensure_ascii=False)
+
+        return json.loads(self._rest.POST(url=url, data=data, **kwargs).content)
+
+    def trace_cell_feeders(self, cube_name: str,
+                           elements: Union[Iterable, str],
+                           dimensions: Iterable[str] = None,
+                           sandbox_name: str = None,
+                           element_separator: str = ",",
+                           hierarchy_separator: str = "&&",
+                           hierarchy_element_separator: str = "::",
+                           **kwargs) -> Dict:
+
+        """ Trace feeders from a cell
+
+        :param cube_name: name of the target cube
+        :param elements:
+        string "Hierarchy1::Element1 && Hierarchy2::Element4, Element9, Element2"
+            - Dimensions are not specified! They are derived from the position.
+            - The , separates the element-selections
+            - If more than one hierarchy is selected per dimension && splits the elementselections
+            - If no Hierarchy is specified. Default Hierarchy will be addressed
+        or
+        Iterable [Element1, Element2, Element3]
+        :param dimensions: optional. Dimension names in their natural order. Will speed up the execution!
+        :param sandbox_name: str
+        :param element_separator: Alternative separator for the elements, if elements are passed as string
+        :param hierarchy_separator: Alternative separator for multiple hierarchies, if elements are passed as string
+        :param hierarchy_element_separator: Alternative separator between hierarchy name and element name, if elements are passed as string
+        :return: feeder trace
+        """
+
+        url = format_url("/Cubes('{}')/tm1.TraceFeeders?$select=Statements,FedCells"
+                         "&$expand=FedCells/Tuple($select=Name,UniqueName,Type), "
+                         "FedCells/Cube($select=Name)", cube_name)
+
+        url = add_url_parameters(url, **{"!sandbox": sandbox_name})
+        if isinstance(elements, str):
+            body_as_dict = self._compose_odata_tuple_from_string(cube_name,
+                                                                 elements,
+                                                                 dimensions,
+                                                                 element_separator,
+                                                                 hierarchy_separator,
+                                                                 hierarchy_element_separator)
+        else:
+            body_as_dict = self._compose_odata_tuple_from_iterable(cube_name, elements, dimensions)
+        data = json.dumps(body_as_dict, ensure_ascii=False)
+
+        return json.loads(self._rest.POST(url=url, data=data, **kwargs).content)
+
+    def check_cell_feeders(self, cube_name: str,
+                           elements: Union[Iterable, str],
+                           dimensions: Iterable[str] = None,
+                           sandbox_name: str = None,
+                           element_separator: str = ",",
+                           hierarchy_separator: str = "&&",
+                           hierarchy_element_separator: str = "::",
+                           **kwargs) -> Dict:
+
+        """ Check feeders
+
+        :param cube_name: name of the target cube
+        :param elements:
+        string "Hierarchy1::Element1 && Hierarchy2::Element4, Element9, Element2"
+            - Dimensions are not specified! They are derived from the position.
+            - The , separates the element-selections
+            - If more than one hierarchy is selected per dimension && splits the elementselections
+            - If no Hierarchy is specified. Default Hierarchy will be addressed
+        or
+        Iterable [Element1, Element2, Element3]
+        :param dimensions: optional. Dimension names in their natural order. Will speed up the execution!
+        :param sandbox_name: str
+        :param element_separator: Alternative separator for the elements, if elements are passed as string
+        :param hierarchy_separator: Alternative separator for multiple hierarchies, if elements are passed as string
+        :param hierarchy_element_separator: Alternative separator between hierarchy name and element name, if elements are passed as string
+        :return: fed cell descriptor
+        """
+
+        url = format_url("/Cubes('{}')/tm1.CheckFeeders"
+                         "?$select=Fed"
+                         "&$expand=Tuple($select=Name,UniqueName,Type),Cube($select=Name)", cube_name)
+
+        url = add_url_parameters(url, **{"!sandbox": sandbox_name})
+        if isinstance(elements, str):
+            body_as_dict = self._compose_odata_tuple_from_string(cube_name,
+                                                                 elements,
+                                                                 dimensions,
+                                                                 element_separator,
+                                                                 hierarchy_separator,
+                                                                 hierarchy_element_separator)
+        else:
+            body_as_dict = self._compose_odata_tuple_from_iterable(cube_name, elements, dimensions)
+        data = json.dumps(body_as_dict, ensure_ascii=False)
+
+        return json.loads(self._rest.POST(url=url, data=data, **kwargs).content)
+
+    def relative_proportional_spread(
+            self,
+            value: float,
+            cube: str,
+            unique_element_names: Iterable[str],
+            reference_unique_element_names: Iterable[str],
+            reference_cube: str = None,
+            sandbox_name: str = None,
+            **kwargs) -> Response:
+        """ Execute relative proportional spread
+
+        :param value: value to be spread
+        :param cube: name of the cube
+        :param unique_element_names: target cell coordinates as unique element names (e.g. ["[d1].[c1]","[d2].[e3]"])
+        :param reference_cube: name of the reference cube. Can be None
+        :param reference_unique_element_names: reference cell coordinates as unique element names
+        :param sandbox_name: str
+        :return:
+        """
+        mdx = """
+        SELECT
+        {{ {rows} }} ON 0
+        FROM [{cube}]
+        """.format(rows="}*{".join(unique_element_names), cube=cube)
+        cellset_id = self._convert_to_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
+
+        payload = {
+            "BeginOrdinal": 0,
+            "Value": "RP" + str(value),
+            "ReferenceCell@odata.bind": list(),
+            "ReferenceCube@odata.bind":
+                format_url("Cubes('{}')", reference_cube if reference_cube else cube)}
+        for unique_element_name in reference_unique_element_names:
+            payload["ReferenceCell@odata.bind"].append(
+                format_url(
+                    "Dimensions('{}')/Hierarchies('{}')/Elements('{}')",
+                    *Utils.dimension_hierarchy_element_tuple_from_unique_name(unique_element_name)))
+
+        return self._post_against_cellset(cellset_id=cellset_id, payload=payload, delete_cellset=True,
+                                          sandbox_name=sandbox_name, **kwargs)
+
+    def clear_spread(
+            self,
+            cube: str,
+            unique_element_names: Iterable[str],
+            sandbox_name: str = None,
+            **kwargs) -> Response:
+        """ Execute clear spread
+        :param cube: name of the cube
+        :param unique_element_names: target cell coordinates as unique element names (e.g. ["[d1].[c1]","[d2].[e3]"])
+        :param sandbox_name: str
+        :return:
+        """
+        mdx = """
+        SELECT
+        {{ {rows} }} ON 0
+        FROM [{cube}]
+        """.format(rows="}*{".join(unique_element_names), cube=cube)
+        cellset_id = self._convert_to_cellset(mdx=mdx, sandbox_name=sandbox_name, **kwargs)
+
+        payload = {
+            "BeginOrdinal": 0,
+            "Value": "C",
+            "ReferenceCell@odata.bind": list()}
+        for unique_element_name in unique_element_names:
+            payload["ReferenceCell@odata.bind"].append(
+                format_url(
+                    "Dimensions('{}')/Hierarchies('{}')/Elements('{}')",
+                    *Utils.dimension_hierarchy_element_tuple_from_unique_name(unique_element_name)))
+
+        return self._post_against_cellset(cellset_id=cellset_id, payload=payload, delete_cellset=True,
+                                          sandbox_name=sandbox_name, **kwargs)

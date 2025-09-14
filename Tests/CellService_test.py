@@ -4796,7 +4796,7 @@ class TestCellService(unittest.TestCase):
             .to_mdx()
 
         # create cellset
-        cellset = self.tm1.cells.create_cellset(mdx)
+        cellset = self.tm1.cells._convert_to_cellset(mdx)
 
         partition = self.tm1.cells.extract_cellset_partition(
             cellset_id=cellset,
@@ -4826,7 +4826,7 @@ class TestCellService(unittest.TestCase):
             MdxHierarchySet.all_members(self.dimension_names[2], self.dimension_names[2])) \
             .to_mdx()
 
-        cellset_id = self.tm1.cells.create_cellset(mdx=mdx)
+        cellset_id = self.tm1.cells._convert_to_cellset(mdx=mdx)
         data_async0 = self.tm1.cells.extract_cellset_axes_raw_async(cellset_id=cellset_id, async_axis=0)
         data_async1 = self.tm1.cells.extract_cellset_axes_raw_async(cellset_id=cellset_id)
         data = self.tm1.cells.extract_cellset_metadata_raw(cellset_id=cellset_id)
@@ -4846,7 +4846,7 @@ class TestCellService(unittest.TestCase):
             MdxHierarchySet.all_members(self.dimension_names[2], self.dimension_names[2])) \
             .to_mdx()
 
-        cellset_id = self.tm1.cells.create_cellset(mdx=mdx)
+        cellset_id = self.tm1.cells._convert_to_cellset(mdx=mdx)
         data_async0 = self.tm1.cells.extract_cellset_axes_raw_async(cellset_id=cellset_id, async_axis=0)
         data = self.tm1.cells.extract_cellset_metadata_raw(cellset_id=cellset_id, delete_cellset=False)
         self.assertEqual(data['Axes'], data_async0['Axes'])
@@ -4866,7 +4866,7 @@ class TestCellService(unittest.TestCase):
             .columns_non_empty().add_hierarchy_set_to_column_axis(MdxHierarchySet.from_str("", "", "{}")) \
             .to_mdx()
 
-        cellset_id = self.tm1.cells.create_cellset(mdx=mdx)
+        cellset_id = self.tm1.cells._convert_to_cellset(mdx=mdx)
         data_async0 = self.tm1.cells.extract_cellset_axes_raw_async(cellset_id=cellset_id, async_axis=0)
         data_async1 = self.tm1.cells.extract_cellset_axes_raw_async(cellset_id=cellset_id)
         data = self.tm1.cells.extract_cellset_metadata_raw(cellset_id=cellset_id)
@@ -4890,7 +4890,7 @@ class TestCellService(unittest.TestCase):
             MdxHierarchySet.all_members(self.dimension_names[2], self.dimension_names[2])) \
             .to_mdx()
 
-        cellset_id = self.tm1.cells.create_cellset(mdx=mdx)
+        cellset_id = self.tm1.cells._convert_to_cellset(mdx=mdx)
         elem_properties = ["Name", "UniqueName", "Attributes/Attr1", "Attributes/Attr2"]
         member_properties = ["Name", "Ordinal", "Weight"]
         data_async0 = self.tm1.cells.extract_cellset_axes_raw_async(cellset_id=cellset_id, async_axis=0,
@@ -4922,7 +4922,7 @@ class TestCellService(unittest.TestCase):
             MdxHierarchySet.all_members(self.dimension_names[2], self.dimension_names[2])) \
             .to_mdx()
 
-        cellset_id = self.tm1.cells.create_cellset(mdx=mdx)
+        cellset_id = self.tm1.cells._convert_to_cellset(mdx=mdx)
         data_async = self.tm1.cells.extract_cellset_cells_raw_async(cellset_id=cellset_id)
         data = self.tm1.cells.extract_cellset_cells_raw(cellset_id=cellset_id)
         self.assertEqual(
@@ -4939,7 +4939,7 @@ class TestCellService(unittest.TestCase):
             MdxHierarchySet.all_members(self.dimension_names[2], self.dimension_names[2])) \
             .to_mdx()
 
-        cellset_id = self.tm1.cells.create_cellset(mdx=mdx)
+        cellset_id = self.tm1.cells._convert_to_cellset(mdx=mdx)
         cell_properties = ['Value', 'Updateable', 'Consolidated', 'RuleDerived']
         data_async = self.tm1.cells.extract_cellset_cells_raw_async(cellset_id=cellset_id,
                                                                     cell_properties=cell_properties)
@@ -4963,7 +4963,7 @@ class TestCellService(unittest.TestCase):
                                         self.dimensions_with_consolidations_names[2])) \
             .to_mdx()
 
-        cellset_id = self.tm1.cells.create_cellset(mdx=mdx)
+        cellset_id = self.tm1.cells._convert_to_cellset(mdx=mdx)
         data_async = self.tm1.cells.extract_cellset_cells_raw_async(cellset_id=cellset_id)
         data = self.tm1.cells.extract_cellset_cells_raw(cellset_id=cellset_id)
         self.assertEqual(
