@@ -182,8 +182,60 @@ def convert_input_to_cellset(func):
         return func(self, *args, cellset_id=cellset_id, **kwargs)
     return wrapper
 
+@decohints
+def convert_input_to_view(func):
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        cellset_id = kwargs.pop('cellset_id', None)
+        view = kwargs.pop('view', None)
+        cube = kwargs.pop('cube', None)
+        mdx = kwargs.pop('mdx', None)
+        private = kwargs.pop('private', False)
 
-class CellsetService(ObjectService):
+        if isinstance(view, View):
+            view_name = view.name
+        elif isinstance(view, str):
+            view_name = view
+        else:
+            view_name = self.suggest_unique_object_name()
+
+        if mdx:
+            cube_name = get_cube(mdx)
+        elif isinstance(cube, Cube):
+            cube_name = cube.name
+        elif isinstance(cube, str):
+            cube_name = cube
+        elif cube is not None:
+            raise TypeError(f"cube must of type '{Optional[Cube | str]}', not {type(cube)}")
+
+        if not view_name:
+            view_name = self.suggest_unique_object_name()
+
+        view_exists = self.exists(cube_name=cube_name, view_name=view_name, private=private, **kwargs)
+
+        try:
+            if not view_exists:
+                if mdx:
+                    self.create(MDXView(cube_name=cube_name, view_name=view_name, MDX=mdx), private=private, **kwargs)
+                elif isinstance(view, View):
+                    self.create(view, private=private, **kwargs)
+                else:
+                    raise ValueError('View does not exist.')
+
+            code = f"ViewZeroOut('{cube_name}','{view_name}');"
+            process = Process(name=self.suggest_unique_object_name(), prolog_procedure=self.generate_enable_sandbox_ti(sandbox_name), epilog_procedure=code)
+
+            process_service = ProcessService(self._rest)
+            success, _, _ = process_service.execute_process_with_return(process, **kwargs)
+            if not success:
+                raise TM1pyException(f"Failed to clear cube: '{cube_name}'.")
+        finally:
+            if not view_exists and (mdx or isinstance(view, View)):
+                self.delete(cube_name, view_name, private=False)
+        return func(self, *args, cellset_id=cellset_id, **kwargs)
+    return wrapper
+
+class DataService(ObjectService):
     """ Service to handle Read and Write operations to TM1 cubes
 
     """
@@ -195,7 +247,7 @@ class CellsetService(ObjectService):
         """
         super().__init__(tm1_rest)
 
-    def create_cellset(self, view: Optional[View | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None,
+    def create_cellset(self, view: Optional[NativeView | MDXView | str] = None, cube: Optional[Cube | str] = None, mdx: Optional[str | MdxBuilder] = None, private: bool = False, sandbox_name: str = None,
                        **kwargs) -> str:
         """
         Create a cellset for querying data from a cube using a view or MDX expression.
@@ -270,6 +322,23 @@ class CellsetService(ObjectService):
 
         view_service = ViewService(self._rest)
         view_service.clear_view(view=view, cube=cube, mdx=mdx, sandbox_name=sandbox_name, private=private, **kwargs)
+
+
+
+    def _compact_json_headers(self, use_compact: bool):
+        if not use_compact:
+            return self._rest._headers
+
+        headers = self._rest._headers.copy()
+        accept_header = headers['Accept']
+        parts = accept_header.split(';')
+        parts.insert(1, 'tm1.compact=v0') # Point of insertion is important. Needs to come after application/json
+        headers['Accept'] = ";".join(parts)
+        return headers
+
+##################################################################
+# - Old CellService Functions, that are waiting to be replaced - #
+##################################################################
 
     @convert_input_to_cellset
     def get_value(self, cube_name: str, elements: Union[str, Iterable] = None, dimensions: List[str] = None,
