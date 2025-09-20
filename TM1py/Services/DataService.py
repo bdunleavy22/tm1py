@@ -13,6 +13,7 @@ from collections import OrderedDict
 from concurrent.futures.thread import ThreadPoolExecutor
 from contextlib import suppress
 from io import StringIO
+from pprint import pprint
 from typing import List, Union, Dict, Iterable, Tuple, Optional, Any, Sequence, Literal
 
 import ijson
@@ -20,8 +21,9 @@ import mdxpy
 from mdxpy import MdxHierarchySet, MdxBuilder, Member, MdxTuple
 from requests import Response
 
-from TM1py import NativeView, MDXView, View, ElementService
+from TM1py.Objects import NativeView, MDXView, View
 from TM1py.Services.CubeService import CubeService
+from TM1py.Services.ElementService import ElementService
 from TM1py.Exceptions.Exceptions import TM1pyException, TM1pyWritePartialFailureException, TM1pyWriteFailureException, \
     TM1pyRestException
 from TM1py.Objects import View, Cube
@@ -303,6 +305,18 @@ class DataService(ObjectService):
                 cellset_as_dict = self._convert_df_to_cellset_as_dict(df)
             if cellset_as_dict:
                 return (Member.of(dimensions[i], element) for elements in cellset_as_dict.keys() for i, element in enumerate(elements))
+
+        if cellset_id:
+            url = format_url("/Cellsets('{}')?$expand=Axes($select=Ordinal;"
+                             "$expand=Tuples($expand=Members($select=Name)),"
+                             "Hierarchies($select=Name;$expand=Dimension($select=Name)))", cellset_id)
+            kwargs['use_compact_json'] = True
+            axes = self._rest.GET(url=url, **self._compact_json_headers(kwargs=kwargs)).json()['value'][1]
+            pprint(axes)
+            indices = [pd.MultiIndex.from_tuples([[axis_element[0] for axis_element in axis_elements[1]] for axis_elements in axis[2]], names=[f'{dim_hier[1][0]}:{dim_hier[0]}' for dim_hier in axis[1]]) if axis[1] else None for axis in axes]
+
+            for x in indices:
+                print(x)
 
         # # Create View from MDX
         # if mdx:
