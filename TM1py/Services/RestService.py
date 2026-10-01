@@ -143,6 +143,7 @@ class RestService:
         - **compress_request_body** (bool): Gzip-compress request bodies at the transport seam. Opt-in. Default: False.
         - **gzip_min_bytes** (int): Minimum (encoded) request body size in bytes to compress. Default: 1024.
         - **gzip_compress_level** (int): Gzip compression level, 1 (fastest) to 9 (smallest). Default: 6.
+        - **keep_authorization_header** (bool): Send the Authorization header on every request, not only the first. Default: False
 
         :param kwargs: See description above for all supported arguments
         """
@@ -184,6 +185,7 @@ class RestService:
         self._compress_request_body = self.translate_to_boolean(kwargs.get("compress_request_body", False))
         self._gzip_min_bytes = max(0, int(kwargs.get("gzip_min_bytes", 1024)))
         self._gzip_compress_level = int(kwargs.get("gzip_compress_level", 6))
+        self._keep_authorization_header = kwargs.get("keep_authorization_header", False)
         # validate the level up front: an out-of-range value otherwise raises a zlib.error deep
         # inside gzip.compress at request time, which is harder to trace back to this kwarg.
         if not 1 <= self._gzip_compress_level <= 9:
@@ -1040,8 +1042,10 @@ class RestService:
             if session_id is not None:
                 self._s.cookies.set("TM1SessionId", session_id)
 
-            # After we have session cookie, drop the Authorization Header
-            self.remove_http_header("Authorization")
+            # After we have session cookie, drop the Authorization Header, unless the
+            # server authenticates every request (an OAuth gateway, such as PAW's).
+            if not self._keep_authorization_header:
+                self.remove_http_header("Authorization")
 
     def _url_and_body(self, url: str, data: str, encoding: str = "utf-8") -> Tuple[str, bytes]:
         """create proper url and payload"""
